@@ -40,15 +40,39 @@ A self-hosted envelope (zero-based) budgeting app: give every dollar a job, roll
 
 ## 1. Run it locally
 
-You need **Node.js 20 or newer**.
+You need **Node.js 20 or newer** (the current LTS release is best) and **git**. It runs on Linux, macOS and Windows.
+
+### Linux and macOS
+
+On a Mac, install Node with the installer from https://nodejs.org or with Homebrew (`brew install node`). git comes with Apple's command line tools (`xcode-select --install`).
 
 ```bash
-cd ~/claude/mani
+git clone https://github.com/<you>/mani.git
+cd mani
 npm install
 cp .env.example .env        # optional; edit time zone, Plaid keys, etc.
 npm run build
 npm start
 ```
+
+### Windows (no WSL needed)
+
+Install **Node.js LTS** from https://nodejs.org and **Git for Windows** from https://git-scm.com. Then, in PowerShell:
+
+```powershell
+git clone https://github.com/<you>/mani.git
+cd mani
+npm install
+Copy-Item .env.example .env   # optional; edit time zone, Plaid keys, etc.
+npm run build
+npx tsx server/index.ts
+```
+
+On Windows, start the server with `npx tsx server/index.ts` instead of `npm start`, which uses Mac/Linux shell syntax. Every other `npm run …` command works as written.
+
+If `npm install` fails while building `better-sqlite3`, you're probably on a very new or odd Node version with no ready-made build. Switch to the current Node LTS and run `npm install` again.
+
+### First visit
 
 Open **http://localhost:3000**. The first visit asks you to name the budget and set a password.
 
@@ -143,27 +167,96 @@ Two things matter:
 
 Use a mini PC, an old laptop, a Raspberry Pi 4/5, or a NAS that runs Docker.
 
-1. Run the app there, using Docker (below) or `npm start` with the systemd unit in `deploy/mani.service`.
+1. Run the app there and keep it running. See below for Windows, Mac, Linux (the systemd unit in `deploy/mani.service`) or Docker.
 2. Install **Tailscale** (https://tailscale.com, free for personal use) on that machine and on your phone and laptop.
 3. Open `http://<machine-name>:3000` from any of your devices, anywhere. Nothing is exposed publicly.
    - To get a real HTTPS URL, run `tailscale serve --bg 3000`. You get `https://<machine>.<tailnet>.ts.net`.
    - Set `HOST=0.0.0.0` in `.env` if you'll connect over the Tailscale IP instead of `tailscale serve`.
 
-> **WSL note:** this machine (Windows + WSL) works for trying the app out. WSL shuts down when it's idle or when Windows sleeps, so automatic syncing will pause. For 24/7 use, prefer a small always-on device or a VPS.
+Whatever the computer, set it to **never sleep** while plugged in. A sleeping computer can't sync or answer your phone.
 
-### Keep it running 24/7 on a Windows PC (WSL)
+### Keep it running 24/7 on Windows (no WSL)
 
-`deploy/start-mani.sh` starts Mani and restarts it within seconds if it ever stops. It logs to `data/logs/mani.log`. Have Windows run it at boot, even before anyone signs in, by running this in **PowerShell as administrator**. Adjust `Ubuntu_2`/`savvy` to your WSL distro and Linux user; `wsl -l -v` lists distros. It doesn't need your Windows password, so it also works with PIN/Windows Hello-only sign-in.
+A scheduled task starts Mani when Windows boots, even before anyone signs in, and restarts it if it stops. Run this in **PowerShell as administrator** from inside the `mani` folder. It doesn't need your Windows password, so it also works if you only sign in with a PIN or Windows Hello.
 
 ```powershell
-$action = New-ScheduledTaskAction -Execute "C:\Windows\System32\wsl.exe" -Argument "-d Ubuntu_2 -u savvy -- bash /home/savvy/claude/mani/deploy/start-mani.sh"
+New-Item -ItemType Directory -Force data\logs | Out-Null
+$dir = (Get-Location).Path
+$action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c npx tsx server/index.ts >> data\logs\mani.log 2>&1" -WorkingDirectory $dir
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
+Register-ScheduledTask -TaskName "Mani budget" -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+Start-ScheduledTask "Mani budget"
+```
+
+Then open http://localhost:3000. The log is in `data\logs\mani.log`. If the server crashes, the task tries to start it again every minute.
+
+- **Other devices on your Wi-Fi:** set `HOST=0.0.0.0` in `.env`, restart the task (`Stop-ScheduledTask "Mani budget"`, then `Start-ScheduledTask "Mani budget"`), and allow the port through the firewall:
+  ```powershell
+  New-NetFirewallRule -DisplayName "Mani budget (port 3000)" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow -Profile Private
+  ```
+- **From anywhere:** install Tailscale for Windows and run `tailscale serve --bg 3000` in a terminal. In Tailscale's settings, turn on **Run unattended** so it keeps working when you're signed out.
+- **Stop:** `Stop-ScheduledTask "Mani budget"`. **Turn off auto-start:** `Disable-ScheduledTask "Mani budget"`.
+- **After updating** (see *Updating* below), run `npm run build` and then restart the task.
+
+### Keep it running 24/7 on a Mac
+
+macOS's built-in `launchd` starts Mani when you log in and restarts it if it stops. From inside the `mani` folder, run:
+
+```bash
+mkdir -p data/logs ~/Library/LaunchAgents
+cat > ~/Library/LaunchAgents/com.mani.budget.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mani.budget</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/zsh</string><string>-lc</string><string>exec npm start</string></array>
+  <key>WorkingDirectory</key><string>$(pwd)</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$(pwd)/data/logs/mani.log</string>
+  <key>StandardErrorPath</key><string>$(pwd)/data/logs/mani.log</string>
+</dict>
+</plist>
+EOF
+launchctl load -w ~/Library/LaunchAgents/com.mani.budget.plist
+```
+
+Then open http://localhost:3000.
+
+- It runs while you're logged in. To have it start after a power cut without anyone at the keyboard, turn on automatic login: **System Settings → Users & Groups**.
+- **Stop sleep:** in **System Settings → Battery** (or **Energy** on a desktop Mac), turn on *Prevent automatic sleeping when the display is off*.
+- **Other devices on your Wi-Fi:** set `HOST=0.0.0.0` in `.env`, restart (below), and open `http://<your-mac-name>.local:3000`. Allow incoming connections for `node` if the firewall asks.
+- **From anywhere:** install Tailscale for Mac and run `tailscale serve --bg 3000`.
+- **Restart:** `launchctl kickstart -k gui/$(id -u)/com.mani.budget`. **Stop and turn off auto-start:** `launchctl unload -w ~/Library/LaunchAgents/com.mani.budget.plist`.
+
+### Docker (Mac, Windows or Linux)
+
+If you'd rather use **Docker Desktop**, run this from the `mani` folder:
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+The container restarts on its own (`restart: unless-stopped`). Turn on *Start Docker Desktop when you sign in* in Docker Desktop's settings. Your data is kept in `./data`. The app is only reachable from the computer itself, at http://localhost:3000. To reach it from your phone, use `tailscale serve --bg 3000`.
+
+### Keep it running 24/7 on Windows with WSL
+
+If you already run the app inside WSL, `deploy/start-mani.sh` starts Mani and restarts it within seconds if it ever stops. It logs to `data/logs/mani.log`. WSL shuts down when it's idle unless something is running in it, so start it from a scheduled task at boot. Run this in **PowerShell as administrator**. Replace `<distro>`, `<user>` and the path with your own; `wsl -l -v` lists your distros.
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "C:\Windows\System32\wsl.exe" -Argument "-d <distro> -u <user> -- bash /home/<user>/mani/deploy/start-mani.sh"
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
 Register-ScheduledTask -TaskName "Mani budget" -Action $action -Trigger $trigger -Settings $settings -Principal $principal
 ```
 
-**Reaching it from other devices on your Wi-Fi.** Mani listens privately on port 3001 (`HOST=127.0.0.1`, `PORT=3001` in `.env`), and a Windows port-forwarding rule publishes it as port 3000. If WSL uses mirrored networking, Mani and the forwarding rule can't both use port 3000. In admin PowerShell:
+**Reaching it from other devices on your Wi-Fi (WSL).** Mani listens privately on port 3001 (`HOST=127.0.0.1`, `PORT=3001` in `.env`), and a Windows port-forwarding rule publishes it as port 3000. If WSL uses mirrored networking, Mani and the forwarding rule can't both use port 3000. In admin PowerShell:
 
 ```powershell
 netsh interface portproxy add v4tov4 listenport=3000 listenaddress=0.0.0.0 connectport=3001 connectaddress=127.0.0.1
@@ -172,7 +265,7 @@ netsh interface portproxy add v4tov4 listenport=3000 listenaddress=0.0.0.0 conne
 New-NetFirewallRule -DisplayName "Mani budget (port 3000)" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow -Profile Private
 ```
 
-Also set Windows to never sleep when plugged in, and turn on Tailscale's **Run unattended** if you use Funnel. To stop: `Stop-ScheduledTask "Mani budget"`; to turn off auto-start: `Disable-ScheduledTask "Mani budget"`.
+Also turn on Tailscale's **Run unattended** if you use Tailscale on Windows. To stop: `Stop-ScheduledTask "Mani budget"`; to turn off auto-start: `Disable-ScheduledTask "Mani budget"`.
 
 ### Option 2 — A small VPS (about $4–6/month)
 
