@@ -1,0 +1,275 @@
+# Mani — self-hosted zero-based budgeting
+
+*Lukautim mani* Named after the Tok Pisin word for money; the logo is the Papua New Guinea 1-kina coin (two saltwater crocodiles around the centre hole), shown in gold.
+
+A self-hosted envelope (zero-based) budgeting app: give every dollar a job, roll money over month to month, and handle credit cards automatically. It can also import transactions from your banks and credit cards on its own.
+
+## Features
+
+**Budget**
+- Ready to Assign, with a breakdown: left over, income this month, last month's overspending, assigned now, assigned in future months
+- Category groups and categories: add, rename, hide, move and delete (with reassignment)
+- Assigned / Activity / Available columns. Positive balances roll over; negative ones reset to zero next month
+- Cash overspending (red) is taken out of next month's Ready to Assign. Credit overspending (yellow) becomes card debt
+- **Credit card payment categories**: spending from a funded category moves money into the card's payment category, refunds move it back, and a payment is a transfer from checking to the card
+- Move money and cover overspending from the Available pill
+- Targets: *set aside X a month*, *refill up to X*, *have a balance of X*, and *have X by a date*. Each shows a progress bar and how much more is needed
+- Auto-Assign: Underfunded, Assigned Last Month, Spent Last Month, Average Assigned, Average Spent, Reset Available, Reset Assigned
+- Age of Money
+- The Assigned box accepts math: `100+25`, `40*3`, or `+20` to add to the current amount
+
+**Accounts and transactions**
+- Budget accounts (checking, savings, cash, credit card, line of credit) and tracking accounts (asset, liability, mortgage, loan)
+- A register with cleared / uncleared / working balances, search, flags, bulk actions, and split transactions
+- Transfers between any two accounts, kept in sync on both sides
+- Reconcile: confirm or enter your bank's balance; an adjustment is created if they differ
+- Scheduled and repeating transactions, entered automatically on their date
+- Each payee remembers its last category. Import rules can rename messy bank descriptions and pick a category
+
+**Auto import (Direct Import)**
+- **SimpleFIN Bridge**: paste a token and you're connected. Easiest option for personal use
+- **Plaid**: a widely used US bank aggregator. Opens the familiar bank-login popup
+- Imported transactions wait for your **approval**. They are **auto-matched** to transactions you already typed in (same amount, within 10 days) and **de-duplicated**
+- A new linked account gets a starting balance so it matches the bank exactly
+- Imports run every N hours in the background, and whenever you press **Import** in the account
+- **File import** (CSV with column mapping, OFX, QFX) for banks that aggregators don't support
+
+**Also included:** Reports (Spending, Net Worth, Income v Expense), password login, encrypted bank credentials, CSV export, one-click database backup, a phone-friendly layout, and dark mode.
+
+---
+
+## 1. Run it locally
+
+You need **Node.js 20 or newer**.
+
+```bash
+cd ~/claude/mani
+npm install
+cp .env.example .env        # optional; edit time zone, Plaid keys, etc.
+npm run build
+npm start
+```
+
+Open **http://localhost:3000**. The first visit asks you to name the budget and set a password.
+
+To work on the code with hot reload, run `npm run dev` and open http://localhost:5173. Run `npm test` for the budget-math test suite.
+
+## 2. Link your banks and credit cards
+
+In the app, click **+ Add Account → Linked**, or go to **Settings & Bank Connections → + Link a bank**. Both providers below are supported, and you can use both at the same time. The same steps are shown inside the app.
+
+### Option A — SimpleFIN Bridge (recommended for personal use)
+
+- Costs **$1.50/month or $15/year**, paid to SimpleFIN. That covers up to 25 institutions.
+- No developer account, no keys, no HTTPS requirement.
+
+Steps:
+
+1. Sign up at **https://bridge.simplefin.org/simplefin/create**.
+2. In SimpleFIN Bridge, add your institutions by logging in to each bank and card.
+3. Create a **Setup Token** for a new app and copy it.
+4. In Mani: **Add Account → Linked → SimpleFIN Bridge**. Paste the token and click **Connect**.
+5. For each bank account, choose one of:
+   - **New account**: pick its name and type
+   - **Existing account**: link it to an account you already track by hand
+   - **Don't import**
+
+   Also choose the date to start importing from. Click **Import transactions**.
+6. New transactions show up highlighted. Click **Approve** on each, or **Approve all**.
+
+Notes:
+- A setup token works only once. The app swaps it for a private access URL and stores that encrypted.
+- SimpleFIN asks apps to make about 24 requests a day at most. The default of every 6 hours stays well inside that.
+
+### Option B — Plaid
+
+- Plaid's **Trial plan** for new teams is free and covers up to 10 real (Production) bank connections. Check your Plaid dashboard for your current limits.
+- Requires a free developer account.
+
+Steps:
+
+1. Sign up at **https://dashboard.plaid.com/signup**.
+2. Open **Developers → Keys** and copy your `client_id` and secret.
+3. Add them to `.env`:
+   ```
+   PLAID_CLIENT_ID=xxxxxxxx
+   PLAID_SECRET=xxxxxxxx
+   PLAID_ENV=sandbox        # switch to production once you have Production access
+   ```
+4. Restart the server.
+5. In Mani: **Add Account → Linked → Plaid → Connect with Plaid**.
+   - In sandbox, log in with `user_good` / `pass_good` to get fake test data.
+6. When sandbox works, request **Production** access in the Plaid dashboard. Set `PLAID_ENV=production` and the production secret, then restart.
+7. Banks that use **OAuth** (Chase, Bank of America, Wells Fargo, Capital One, …) work without extra setup. Plaid opens the bank's own login page in a popup.
+   - **Optional:** `PLAID_REDIRECT_URI` is only needed if you open the app inside an in-app browser or webview on a phone. To use it, add `https://YOUR-DOMAIN/oauth-return` under **Allowed redirect URIs** in the Plaid dashboard and set `PLAID_REDIRECT_URI` to the same value. It must be HTTPS.
+   - Note: on the free Trial plan, removing a connection does **not** give back one of your 10 slots, and linking the same bank twice uses two. Use **Fix connection** instead of re-linking.
+8. If a bank later asks you to log in again, the connection turns red in Settings. Click **Fix connection**.
+
+### Testing Plaid in Sandbox first
+
+Use a separate copy of the data so fake bank data never mixes with your real budget:
+
+```bash
+DATA_DIR=./data-sandbox PORT=3001 PLAID_ENV=sandbox npm start
+```
+
+- Log in to Plaid's fake banks with `user_good` / `pass_good`, or `user_transactions_dynamic` with any password for more realistic history.
+- Force a "log in again" error to test **Fix connection**: `DATA_DIR=./data-sandbox PLAID_ENV=sandbox npm run plaid:sandbox -- reset-login <connectionId>`. Run `npm run plaid:sandbox -- list` (with the same settings) to see connection ids.
+- Generate new transactions: `npm run plaid:sandbox -- refresh <connectionId>`, wait about 30 seconds, then press **Import**.
+
+When you're done, delete `data-sandbox/`.
+
+### Option C — File import
+
+Open an account, click **File Import**, and choose a CSV, OFX or QFX file downloaded from your bank. Duplicates are skipped automatically.
+
+### How imports behave
+
+- Only **posted** transactions are imported. Pending ones arrive once they post.
+- An imported transaction that matches one you entered (same account, same amount, within ±10 days) is **merged** with it and marked "Matched". If the match is wrong, use **Unmatch**.
+- The category is filled in from your Payee rules (**Payees & Rules**) or from the category you last used for that payee.
+- Approving a transaction, or editing and saving it, approves it.
+
+## 3. Hosting: what you need and your options
+
+The app is **one Node process plus one SQLite file** (`data/budget.db`). There's no separate database server or cloud account to set up.
+
+Two things matter:
+
+- **It must keep running** for automatic bank sync and scheduled transactions to happen. If it's off, it catches up the next time it starts.
+- **Don't expose it to the open internet without HTTPS.** It holds your financial data. Using a private network such as Tailscale is the safest choice.
+
+### Option 1 — Your own always-on computer plus Tailscale (recommended, free)
+
+Use a mini PC, an old laptop, a Raspberry Pi 4/5, or a NAS that runs Docker.
+
+1. Run the app there, using Docker (below) or `npm start` with the systemd unit in `deploy/mani.service`.
+2. Install **Tailscale** (https://tailscale.com, free for personal use) on that machine and on your phone and laptop.
+3. Open `http://<machine-name>:3000` from any of your devices, anywhere. Nothing is exposed publicly.
+   - To get a real HTTPS URL, run `tailscale serve --bg 3000`. You get `https://<machine>.<tailnet>.ts.net`.
+   - Set `HOST=0.0.0.0` in `.env` if you'll connect over the Tailscale IP instead of `tailscale serve`.
+
+> **WSL note:** this machine (Windows + WSL) works for trying the app out. WSL shuts down when it's idle or when Windows sleeps, so automatic syncing will pause. For 24/7 use, prefer a small always-on device or a VPS.
+
+### Keep it running 24/7 on a Windows PC (WSL)
+
+`deploy/start-mani.sh` starts Mani and restarts it within seconds if it ever stops. It logs to `data/logs/mani.log`. Have Windows run it at boot, even before anyone signs in, by running this in **PowerShell as administrator**. Adjust `Ubuntu_2`/`savvy` to your WSL distro and Linux user; `wsl -l -v` lists distros. It doesn't need your Windows password, so it also works with PIN/Windows Hello-only sign-in.
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "C:\Windows\System32\wsl.exe" -Argument "-d Ubuntu_2 -u savvy -- bash /home/savvy/claude/mani/deploy/start-mani.sh"
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
+Register-ScheduledTask -TaskName "Mani budget" -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+```
+
+**Reaching it from other devices on your Wi-Fi.** Mani listens privately on port 3001 (`HOST=127.0.0.1`, `PORT=3001` in `.env`), and a Windows port-forwarding rule publishes it as port 3000. If WSL uses mirrored networking, Mani and the forwarding rule can't both use port 3000. In admin PowerShell:
+
+```powershell
+netsh interface portproxy add v4tov4 listenport=3000 listenaddress=0.0.0.0 connectport=3001 connectaddress=127.0.0.1
+```
+```powershell
+New-NetFirewallRule -DisplayName "Mani budget (port 3000)" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow -Profile Private
+```
+
+Also set Windows to never sleep when plugged in, and turn on Tailscale's **Run unattended** if you use Funnel. To stop: `Stop-ScheduledTask "Mani budget"`; to turn off auto-start: `Disable-ScheduledTask "Mani budget"`.
+
+### Option 2 — A small VPS (about $4–6/month)
+
+Hetzner, DigitalOcean, Linode and Vultr all work. 1 vCPU and 1 GB RAM is plenty.
+
+```bash
+# on the server (Ubuntu), after installing Docker:
+git clone <your copy of this repo> mani && cd mani
+cp .env.example .env && nano .env      # set TZ, Plaid keys, etc.
+docker compose up -d --build
+```
+
+Then add HTTPS:
+- Point a domain's DNS at the server.
+- Install **Caddy** and use `deploy/Caddyfile` (change the domain). Caddy gets and renews the HTTPS certificate automatically.
+
+The compose file binds the app to `127.0.0.1` only, so the only way in from outside is through Caddy.
+
+Alternatives:
+- **Cloudflare Tunnel** gives you HTTPS without opening any ports.
+- **Fly.io** or **Railway** work too: mount a persistent volume at `/data`.
+
+### Backups
+
+Use **Settings → Download full backup**, or copy the `data/` folder. Keep these two files together:
+- `data/budget.db`: your data
+- `data/secret.key`: needed to decrypt the bank links
+
+If you lose the key, your budget data is fine; you only need to re-link your banks.
+
+### Updating
+
+```bash
+git pull
+npm install && npm run build
+# then restart: npm start, or docker compose up -d --build
+```
+
+The database schema is created and updated automatically.
+
+## Using it on your phone
+
+On phones the app switches to a touch layout:
+- **Bottom tab bar:** Budget, Accounts, **+** (add a transaction), Reports, Settings.
+- **Transactions as cards:** tap **Needs a category ▾** to pick a category from a searchable list that shows each balance. Picking a category also approves the transaction. Tap a card to edit it in a full-screen form.
+- **Categories:** tap one on the Budget screen to see its details, targets and Auto-Assign.
+
+To open it on your phone, the phone must be able to reach the server:
+- **Tailscale (recommended):** install it on the server and your phone, run `tailscale serve --bg 3000`, and open `https://<machine>.<tailnet>.ts.net` on your phone. This works from anywhere and stays private.
+- **Same Wi-Fi only:** set `HOST=0.0.0.0` in `.env`, restart, and open `http://<computer's LAN IP>:3000`. On WSL you'll also need Windows port forwarding, so Tailscale is easier.
+
+Then add it to your home screen so it opens full screen like an app:
+- **iPhone:** in Safari, tap Share → **Add to Home Screen**.
+- **Android:** in Chrome, tap ⋮ → **Add to Home screen** (or **Install app**).
+
+## Two-step login
+
+Turn it on in **Settings → Security → Set up two-step login**: scan the QR code with an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, 1Password…), enter the code, and save the 10 recovery codes. Logging in then needs your password plus the 6-digit code, or one recovery code (each works once). Turn this on before making the app reachable from the internet.
+
+Locked out? Run these on the computer that hosts the app; both sign out every device:
+
+```bash
+npm run auth -- disable-2fa
+```
+```bash
+npm run auth -- reset-password
+```
+
+## Configuration reference (`.env`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HOST` / `PORT` | `127.0.0.1` / `3000` | Listen address |
+| `DATA_DIR` | `./data` | Location of the database and key |
+| `TZ` | system | Your time zone, used for "today" and scheduled transactions |
+| `SYNC_INTERVAL_HOURS` | `6` | Hours between automatic bank syncs (`0` = off; also settable in Settings) |
+| `ENCRYPTION_KEY` | auto | Encrypts bank tokens. If unset, a key is generated in `data/secret.key` |
+| `TRUST_PROXY` | `loopback` | Set to `1` behind a reverse proxy on another host or in Docker |
+| `PLAID_CLIENT_ID`, `PLAID_SECRET` | — | Plaid keys |
+| `PLAID_ENV` | `sandbox` | `sandbox` or `production` |
+| `PLAID_COUNTRY_CODES` | `US` | Comma list, e.g. `US,CA` |
+| `PLAID_REDIRECT_URI` | — | Optional `https://…/oauth-return`; only needed for in-app browsers or webviews |
+
+## Limitations
+
+- One user and one budget per install. Run a second copy with a different `DATA_DIR` and `PORT` for a second budget.
+- Targets have 4 types; there are no weekly or custom-cadence targets.
+- No special loan-account categories. Loans are tracking accounts; pay them with a categorized transfer.
+- Split transactions can't include a transfer line.
+- No undo button and no drag-and-drop reordering; move categories between groups from the category panel.
+- Bank sync polls on a timer instead of using Plaid webhooks.
+
+## Project layout
+
+```
+server/      Express API, SQLite schema, budget engine (budget.ts), bank sync (banks.ts), tests
+client/      React UI (Vite)
+shared/      Date/money helpers used by both sides
+deploy/      Caddyfile and systemd unit
+```

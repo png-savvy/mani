@@ -1,0 +1,13 @@
+services:
+  mani:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    # Only reachable from this machine; put Caddy/Tailscale/Cloudflare Tunnel in front for remote access.
+    ports:
+      - "127.0.0.1:3000:3000"

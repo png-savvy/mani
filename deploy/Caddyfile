@@ -1,0 +1,4 @@
+# Automatic HTTPS reverse proxy. Replace the domain, point its DNS A record at your server, then: caddy run
+budget.example.com {
+	reverse_proxy 127.0.0.1:3000
+}

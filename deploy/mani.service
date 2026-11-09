@@ -1,0 +1,14 @@
+# systemd unit for running without Docker. Copy to /etc/systemd/system/mani.service,
+# adjust User and WorkingDirectory, then: sudo systemctl enable --now mani
+[Unit]
+Description=Mani budget
+After=network-online.target
+
+[Service]
+User=youruser
+WorkingDirectory=/home/youruser/mani
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
