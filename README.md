@@ -4,6 +4,31 @@
 
 A self-hosted envelope (zero-based) budgeting app: give every dollar a job, roll money over month to month, and handle credit cards automatically. It can also import transactions from your banks and credit cards on its own.
 
+![The budget screen: categories with what was assigned, spent and left this month](docs/screenshots/budget.png)
+
+| Review new transactions from every account in one list | The same list on a phone |
+| --- | --- |
+| ![Review list on a computer, with an Amazon purchase showing what was bought](docs/screenshots/review.png) | <img src="docs/screenshots/review-phone.png" alt="Review list on a phone" width="280"> |
+
+*Screenshots use made-up demo data.*
+
+## Contents
+
+- [Features](#features)
+- [1. Run it locally](#1-run-it-locally)
+- [2. Link your banks and credit cards](#2-link-your-banks-and-credit-cards)
+- [3. Hosting: what you need and your options](#3-hosting-what-you-need-and-your-options)
+  - [Reaching it from your phone with Tailscale](#reaching-it-from-your-phone-with-tailscale)
+  - [Keep it running 24/7: Windows](#keep-it-running-247-on-windows-no-wsl) · [Mac](#keep-it-running-247-on-a-mac) · [Docker](#docker-mac-windows-or-linux) · [Windows with WSL](#keep-it-running-247-on-windows-with-wsl)
+  - [Backups](#backups) · [Updating](#updating)
+- [Using it on your phone](#using-it-on-your-phone)
+- [Notifications for new transactions](#notifications-for-new-transactions)
+- [Amazon purchases: the browser extension](#amazon-purchases-the-browser-extension)
+- [Two-step login](#two-step-login)
+- [Configuration reference](#configuration-reference-env)
+- [Limitations](#limitations)
+- [Project layout](#project-layout)
+
 ## Features
 
 **Budget**
@@ -33,6 +58,13 @@ A self-hosted envelope (zero-based) budgeting app: give every dollar a job, roll
 - A new linked account gets a starting balance so it matches the bank exactly
 - Imports run every N hours in the background, and whenever you press **Import** in the account
 - **File import** (CSV with column mapping, OFX, QFX) for banks that aggregators don't support
+
+**Reviewing what comes in**
+- One **Review** list for every account: anything not yet approved or still missing a category
+- Pick a category right in the list. A brief popup shows the category's balance before and after, with **Undo**
+- **Transfers between your own accounts are detected** and joined automatically, so they don't need a category
+- **Phone notifications** when new transactions arrive
+- **Amazon purchases show what you bought**, using a small browser extension that reads your own order history
 
 **Also included:** Reports (Spending, Net Worth, Income v Expense), password login, encrypted bank credentials, CSV export, one-click database backup, a phone-friendly layout, and dark mode.
 
@@ -168,12 +200,42 @@ Two things matter:
 Use a mini PC, an old laptop, a Raspberry Pi 4/5, or a NAS that runs Docker.
 
 1. Run the app there and keep it running. See below for Windows, Mac, Linux (the systemd unit in `deploy/mani.service`) or Docker.
-2. Install **Tailscale** (https://tailscale.com, free for personal use) on that machine and on your phone and laptop.
-3. Open `http://<machine-name>:3000` from any of your devices, anywhere. Nothing is exposed publicly.
-   - To get a real HTTPS URL, run `tailscale serve --bg 3000`. You get `https://<machine>.<tailnet>.ts.net`.
-   - Set `HOST=0.0.0.0` in `.env` if you'll connect over the Tailscale IP instead of `tailscale serve`.
+2. Set the computer to **never sleep** while plugged in. A sleeping computer can't sync or answer your phone.
+3. Set up Tailscale as described next, so your phone and laptop can reach it.
 
-Whatever the computer, set it to **never sleep** while plugged in. A sleeping computer can't sync or answer your phone.
+### Reaching it from your phone with Tailscale
+
+[Tailscale](https://tailscale.com) (free for personal use) joins your own devices into a private network, wherever they are. Mani itself stays listening only on the computer it runs on; Tailscale gives it an HTTPS address that your other devices can open.
+
+**Set it up once**
+
+1. Install Tailscale on the computer that runs Mani **and** on your phone, and sign in to the same Tailscale account on both.
+2. In the Tailscale admin console (https://login.tailscale.com/admin/dns), turn on **MagicDNS** and **HTTPS Certificates**.
+3. On the computer that runs Mani, run:
+   ```bash
+   tailscale serve --bg 3000
+   ```
+   It prints your address, like `https://<machine>.<tailnet>.ts.net`. `--bg` makes it permanent: it survives restarts.
+4. On your phone, make sure the Tailscale app is connected, open that address, and add it to your home screen (see [Using it on your phone](#using-it-on-your-phone)).
+5. On Windows, open Tailscale's settings and turn on **Run unattended**, so it keeps working when nobody is signed in.
+
+**Private or public: Serve vs Funnel**
+
+| | `tailscale serve` (recommended) | `tailscale funnel` |
+| --- | --- | --- |
+| Who can open the address | Only devices signed in to your Tailscale account | Anyone on the internet |
+| Needs the Tailscale app on your phone | Yes, and it must be connected | No, any browser works |
+| What protects your budget | Tailscale, then your Mani password | Only your Mani password (and two-step login) |
+
+- Check which one you have: `tailscale serve status`. If it says **Funnel on**, the address is public.
+- Go back to private: `tailscale funnel reset`, then `tailscale serve --bg 3000`.
+- If you choose Funnel, turn on [two-step login](#two-step-login) first and use a long password.
+
+**Good to know**
+
+- Notifications reach your phone either way, even when the Tailscale app is disconnected; you only need the connection to open the app.
+- `tailscale serve` connects to `127.0.0.1:3000`, so leave `HOST=127.0.0.1` in `.env`. Only set `HOST=0.0.0.0` if you want to use the plain `http://<tailscale-ip>:3000` address without `serve` (no HTTPS, and no notifications or home-screen install, which need HTTPS).
+- If the address stops working, check that Tailscale is running and connected on both devices, then run `tailscale serve status` on the computer.
 
 ### Keep it running 24/7 on Windows (no WSL)
 
@@ -196,7 +258,7 @@ Then open http://localhost:3000. The log is in `data\logs\mani.log`. If the serv
   ```powershell
   New-NetFirewallRule -DisplayName "Mani budget (port 3000)" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow -Profile Private
   ```
-- **From anywhere:** install Tailscale for Windows and run `tailscale serve --bg 3000` in a terminal. In Tailscale's settings, turn on **Run unattended** so it keeps working when you're signed out.
+- **From anywhere:** follow [Reaching it from your phone with Tailscale](#reaching-it-from-your-phone-with-tailscale). In Tailscale's settings, turn on **Run unattended** so it keeps working when you're signed out.
 - **Stop:** `Stop-ScheduledTask "Mani budget"`. **Turn off auto-start:** `Disable-ScheduledTask "Mani budget"`.
 - **After updating** (see *Updating* below), run `npm run build` and then restart the task.
 
@@ -230,7 +292,7 @@ Then open http://localhost:3000.
 - It runs while you're logged in. To have it start after a power cut without anyone at the keyboard, turn on automatic login: **System Settings → Users & Groups**.
 - **Stop sleep:** in **System Settings → Battery** (or **Energy** on a desktop Mac), turn on *Prevent automatic sleeping when the display is off*.
 - **Other devices on your Wi-Fi:** set `HOST=0.0.0.0` in `.env`, restart (below), and open `http://<your-mac-name>.local:3000`. Allow incoming connections for `node` if the firewall asks.
-- **From anywhere:** install Tailscale for Mac and run `tailscale serve --bg 3000`.
+- **From anywhere:** follow [Reaching it from your phone with Tailscale](#reaching-it-from-your-phone-with-tailscale).
 - **Restart:** `launchctl kickstart -k gui/$(id -u)/com.mani.budget`. **Stop and turn off auto-start:** `launchctl unload -w ~/Library/LaunchAgents/com.mani.budget.plist`.
 
 ### Docker (Mac, Windows or Linux)
@@ -314,18 +376,58 @@ The database schema is created and updated automatically.
 ## Using it on your phone
 
 On phones the app switches to a touch layout:
-- **Bottom tab bar:** Budget, Accounts, **+** (add a transaction), Reports, Settings.
+- **Bottom tab bar:** Budget, Review, **+** (add a transaction), Accounts, Settings.
 - **Transactions as cards:** tap **Needs a category ▾** to pick a category from a searchable list that shows each balance. Picking a category also approves the transaction. Tap a card to edit it in a full-screen form.
 - **Categories:** tap one on the Budget screen to see its details, targets and Auto-Assign.
 
 To open it on your phone, the phone must be able to reach the server:
-- **Tailscale (recommended):** install it on the server and your phone, run `tailscale serve --bg 3000`, and open `https://<machine>.<tailnet>.ts.net` on your phone. This works from anywhere and stays private.
-  - **Serve vs Funnel.** `tailscale serve` is private: only devices signed in to your Tailscale account can open the address, so the phone needs the Tailscale app connected. `tailscale funnel` publishes the same address to the whole internet, so it works in any browser without the Tailscale app, but anyone can reach the login page. Check which one you have with `tailscale serve status` ("Funnel on" means public); `tailscale funnel reset` followed by `tailscale serve --bg 3000` goes back to private. If you use Funnel, turn on two-step login first and use a long password.
-- **Same Wi-Fi only:** set `HOST=0.0.0.0` in `.env`, restart, and open `http://<computer's LAN IP>:3000`. On WSL you'll also need Windows port forwarding, so Tailscale is easier.
+- **Tailscale (recommended):** works from anywhere over HTTPS. Follow [Reaching it from your phone with Tailscale](#reaching-it-from-your-phone-with-tailscale).
+- **Same Wi-Fi only:** set `HOST=0.0.0.0` in `.env`, restart, and open `http://<computer's LAN IP>:3000`. On WSL you'll also need Windows port forwarding, so Tailscale is easier. Notifications and installing to the home screen need HTTPS, so they won't work this way.
 
 Then add it to your home screen so it opens full screen like an app:
 - **iPhone:** in Safari, tap Share → **Add to Home Screen**.
 - **Android:** in Chrome, tap ⋮ → **Add to Home screen** (or **Install app**).
+
+## Notifications for new transactions
+
+Mani can notify your phone whenever a bank import brings in new transactions, so you can categorize them right away. Tapping the notification opens the Review list.
+
+1. Open Mani on the phone over its **HTTPS** address (the Tailscale one). On an iPhone, add it to the home screen first and open it from there.
+2. Go to **Settings → Notifications**, turn them on, and allow notifications when the phone asks.
+3. Press **Send a test** to check it arrives.
+
+Notifications are sent straight from your server through the phone maker's push service (Google or Apple), encrypted so only your phone can read them. Each phone or browser is listed in Settings and can be removed there.
+
+## Amazon purchases: the browser extension
+
+Banks only report "Amazon" and an amount. The **Mani Amazon** extension (in `amazon-extension/`) reads your own Amazon order history in your browser and sends it to your own Mani, so each Amazon charge shows what was bought.
+
+**How it works**
+
+1. The extension runs in a browser where you are signed in to Amazon. Every 3 hours, and whenever you press **Sync now**, it reads two of your Amazon pages: **Your Payments → Transactions** (each card charge with its order number) and **Your Orders** (what each order contained).
+2. It sends that list to your Mani server, signing in with a token you create in Mani. Nothing goes anywhere else, and Mani never sees your Amazon password.
+3. Mani matches each Amazon charge to the bank transaction with the same amount around the same date (and the same card, when Amazon shows the last four digits). When an order was charged in several parts, each part is matched separately.
+4. Matched transactions show the full item names in the Review list and the transaction editor, with a link to the order on Amazon.
+
+**Set it up**
+
+1. In Mani, open **Settings → Amazon** and create a token. It is shown once; copy it.
+2. Build the extension: `npm run extension` (needs Python 3). This creates `amazon-extension/dist/`.
+3. Load it in your browser:
+   - **Chrome or Edge:** open `chrome://extensions`, turn on **Developer mode**, press **Load unpacked** and choose `amazon-extension/dist/chrome`.
+   - **Firefox, to try it:** open `about:debugging` → **This Firefox** → **Load Temporary Add-on** and choose `amazon-extension/dist/firefox/manifest.json`. This lasts until Firefox closes.
+   - **Firefox, permanently:** upload `amazon-extension/dist/mani-amazon-firefox.zip` at https://addons.mozilla.org/developers as an add-on distributed **on your own**. Mozilla signs it, usually within minutes, and gives you an `.xpi` file to install.
+4. Open the extension's settings, paste Mani's address (the same one you open in the browser) and the token, and save. If the small popup closes while you copy things, use its **open these settings in a tab** link.
+5. Make sure you're signed in to amazon.com in that browser, then press **Sync now**.
+
+**Good to know**
+
+- It only syncs while that browser is open and signed in to Amazon. It catches up the next time the browser runs; nothing is lost, only delayed.
+- To look less like a robot to Amazon, it reads slowly and stops as soon as it reaches orders Mani already has. Once a week it re-reads the whole look-back period (60 days by default) in case something was missed.
+- In Firefox, it reads older pages by briefly opening an Amazon tab in the background and closing it again. Chrome reads the first page of charges only, and fills in older ones from your order list as estimates.
+- Amazon changes its pages from time to time. If reading stops working, **Settings → Amazon** shows the last error.
+- Only amazon.com (US) is supported.
+- To disconnect, revoke the token in **Settings → Amazon** and remove the extension.
 
 ## Two-step login
 
@@ -371,4 +473,6 @@ server/      Express API, SQLite schema, budget engine (budget.ts), bank sync (b
 client/      React UI (Vite)
 shared/      Date/money helpers used by both sides
 deploy/      Caddyfile and systemd unit
+amazon-extension/   Browser extension that sends your Amazon order details to Mani
+docs/        Screenshots
 ```
