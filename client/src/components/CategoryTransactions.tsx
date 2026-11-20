@@ -6,6 +6,7 @@ import { fmtDate, fmtMonth, money } from '../format';
 import { Sheet } from './ui';
 import TxnEditor from './TxnEditor';
 import type { Txn } from '../types';
+import AmazonItems, { displayMemo } from './AmazonItems';
 
 /** Transactions that used a category (this month, or ever), shown in the category panel. Tap one to edit it. */
 export default function CategoryTransactions({ categoryId, month }: { categoryId: number; month: string }) {
@@ -73,7 +74,8 @@ export default function CategoryTransactions({ categoryId, month }: { categoryId
                     </span>
                     {!t.approved && <span className="tag">To approve</span>}
                   </span>
-                  {t.memo && <span className="cat-txn-memo ellipsis">{t.memo}</span>}
+                  <AmazonItems t={t} className="cat-txn-memo" />
+                  {displayMemo(t) && <span className="cat-txn-memo ellipsis">{displayMemo(t)}</span>}
                 </button>
               </li>
             ))}

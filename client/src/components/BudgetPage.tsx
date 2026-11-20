@@ -6,6 +6,7 @@ import { fmtMonth, money } from '../format';
 import { CategorySelect, Confirm, Modal, MoneyField, Sheet, useClickOutside } from './ui';
 import { useIsMobile, useMediaQuery } from '../hooks';
 import CategoryTransactions from './CategoryTransactions';
+import { ApplyPlanModal } from './PlanPage';
 import type { BudgetCategory, BudgetGroup, BudgetMonth } from '../types';
 import { TARGET_LABELS, TARGET_TYPES, addMonths, currentMonth, isValidMonth, todayISO } from '../../../shared/util';
 
@@ -96,6 +97,7 @@ export default function BudgetPage() {
   const [drag, setDrag] = useState<Drag | null>(null);
   const [drop, setDrop] = useState<DropTarget | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
+  const [applyPlan, setApplyPlan] = useState(false);
   const isMobile = useIsMobile();
   // Below this width the side panel is hidden, so category details open as a sheet instead.
   const narrow = useMediaQuery('(max-width: 1100px)');
@@ -111,7 +113,12 @@ export default function BudgetPage() {
     load();
   }, [load, version]);
 
-  const allCats = useMemo(() => view?.groups.flatMap((g) => g.categories) ?? [], [view]);
+  const showCc = data.settings.showCcPayments;
+  const shownGroups = useMemo(
+    () => (view ? (showCc ? view.groups : view.groups.filter((g) => g.system !== 'credit_card_payments')) : []),
+    [view, showCc],
+  );
+  const allCats = useMemo(() => shownGroups.flatMap((g) => g.categories), [shownGroups]);
   const sel = allCats.find((c) => c.id === selected) ?? null;
 
   if (!view) return <div className="page"><div className="spinner" /></div>;
@@ -170,7 +177,7 @@ export default function BudgetPage() {
     }
   };
 
-  const groups = view.groups.filter((g) => {
+  const groups = shownGroups.filter((g) => {
     if (g.system === 'credit_card_payments' && g.categories.length === 0) return false;
     if (g.hidden && !showHidden) return false;
     return filter === 'all' || g.categories.some(visible);
@@ -186,7 +193,14 @@ export default function BudgetPage() {
     { assigned: 0, activity: 0, available: 0, underfunded: 0 },
   );
   const overspentCount = allCats.filter((c) => c.available < 0).length;
-  const unapprovedCount = data.accounts.reduce((s, a) => s + a.unapprovedCount, 0);
+  const reviewCount = data.accounts.reduce((s, a) => s + a.reviewCount, 0);
+  const brokenBanks = [
+    ...new Set(
+      data.accounts
+        .filter((a) => a.linked && !a.closed && a.connectionStatus && a.connectionStatus !== 'ok')
+        .map((a) => a.institution || a.name),
+    ),
+  ];
 
   return (
     <div className="budget-page">
@@ -232,21 +246,41 @@ export default function BudgetPage() {
           </div>
         </header>
 
+        {view.plan.total > 0 && view.plan.canApply && !view.plan.appliedAt && (
+          <div className="plan-banner">
+            <div className="plan-banner-text">
+              <b>Monthly plan for {fmtMonth(bm)}</b>
+              <span>
+                {money(view.plan.total)} across {view.plan.categories} categor{view.plan.categories === 1 ? 'y' : 'ies'}
+              </span>
+            </div>
+            <div className="row-gap">
+              <Link to="/plan" className="btn btn-small btn-ghost">Edit</Link>
+              <button
+                className="btn btn-small btn-ghost"
+                title="I've already assigned this month myself"
+                onClick={() => run(() => api.post(`/plan/skip/${bm}`), `Monthly plan skipped for ${fmtMonth(bm)}`)}
+              >
+                Skip this month
+              </button>
+              <button className="btn btn-small btn-primary" onClick={() => setApplyPlan(true)}>Auto-assign</button>
+            </div>
+          </div>
+        )}
         {data.unmappedConnections > 0 && (
           <div className="callout callout-warn">
             You linked a bank but haven't chosen which accounts to import. <Link to="/settings">Choose accounts in Settings</Link>
           </div>
         )}
-        {view.uncategorizedCount > 0 && (
-          <div className="callout callout-warn">
-            {view.uncategorizedCount} transaction{view.uncategorizedCount === 1 ? ' needs' : 's need'} a category.{' '}
-            <Link to="/accounts?uncategorized=1">Review them</Link>
+        {brokenBanks.length > 0 && (
+          <div className="callout callout-neg">
+            Automatic import from {brokenBanks.join(', ')} has stopped and needs your attention. <Link to="/settings">Fix it in Settings</Link>
           </div>
         )}
-        {unapprovedCount > 0 && (
+        {reviewCount > 0 && (
           <div className="callout callout-warn">
-            {unapprovedCount} imported transaction{unapprovedCount === 1 ? ' needs' : 's need'} review.{' '}
-            <Link to="/accounts?unapproved=1">Review them</Link>
+            {reviewCount} transaction{reviewCount === 1 ? ' needs' : 's need'} review.{' '}
+            <Link to="/review">Review {reviewCount === 1 ? 'it' : 'them'}</Link>
           </div>
         )}
         {overspentCount > 0 && filter !== 'overspent' && (
@@ -286,6 +320,7 @@ export default function BudgetPage() {
               <button key={f} className={`chip ${filter === f ? 'active' : ''}`} onClick={() => setFilter(f)}>{label}</button>
             ))}
           </div>
+          <Link to="/plan" className="btn btn-small btn-ghost">{view.plan.total > 0 ? 'Monthly Plan' : 'Set up Monthly Plan'}</Link>
           <label className="check-inline">
             <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden(e.target.checked)} /> Show hidden
           </label>
@@ -444,6 +479,7 @@ export default function BudgetPage() {
       )}
 
       {editGroup && <GroupEditor group={editGroup} onClose={() => setEditGroup(null)} />}
+      {applyPlan && <ApplyPlanModal month={bm} again={false} onClose={() => setApplyPlan(false)} />}
     </div>
   );
 }
@@ -534,7 +570,7 @@ function MoveMoney({ month, cat, rta, onClose }: { month: string; cat: BudgetCat
 
 function MoveTarget({ value, onChange, excludeId, includeRta }: { value: number | null; onChange: (v: number | null) => void; excludeId?: number; includeRta: boolean }) {
   const { data } = useApp();
-  const groups = data.groups.filter((g) => g.system !== 'internal');
+  const groups = data.groups.filter((g) => g.system !== 'internal' && (data.settings.showCcPayments || g.system !== 'credit_card_payments'));
   return (
     <select value={value ?? ''} onChange={(e) => onChange(e.target.value === '' ? null : Number(e.target.value))} aria-label="Category">
       <option value="">Choose…</option>
@@ -542,7 +578,7 @@ function MoveTarget({ value, onChange, excludeId, includeRta }: { value: number 
       {groups.map((g) => (
         <optgroup key={g.id} label={g.name}>
           {data.categories
-            .filter((c) => c.groupId === g.id && c.id !== excludeId && c.kind !== 'income')
+            .filter((c) => c.groupId === g.id && c.id !== excludeId && c.kind !== 'income' && (data.settings.showCcPayments || c.kind !== 'cc_payment'))
             .map((c) => (
               <option key={c.id} value={c.id}>{c.name}</option>
             ))}

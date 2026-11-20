@@ -13,12 +13,15 @@ import { currentMonth } from '../../../shared/util';
 export default function CategoryPicker({
   value,
   onSelect,
+  onClear,
   onClose,
   title = 'Choose category',
   includeIncome = true,
 }: {
   value: number | null;
   onSelect: (id: number) => void;
+  /** When given (and a category is set), offers taking the category off, which sends the transaction back to review. */
+  onClear?: () => void;
   onClose: () => void;
   title?: string;
   includeIncome?: boolean;
@@ -58,6 +61,13 @@ export default function CategoryPicker({
     <Sheet title={title} onClose={onClose}>
       <div className="picker">
         <input className="picker-search" type="search" placeholder="Search categories" value={q} onChange={(e) => setQ(e.target.value)} />
+        {onClear && value !== null && !q && (
+          <div className="picker-group">
+            <button className="picker-item picker-clear" onClick={onClear}>
+              <span>No category — send back to review</span>
+            </button>
+          </div>
+        )}
         {showIncome && (
           <div className="picker-group">
             <div className="picker-group-name">Income</div>

@@ -10,8 +10,15 @@ PORT=${PORT:-3000}
 while true; do
   # Keep the log from growing forever (~5 MB, one old copy kept).
   if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG")" -gt 5000000 ]; then mv -f "$LOG" "$LOG.1"; fi
-  if curl -s -m 3 -o /dev/null "http://127.0.0.1:$PORT/api/auth/status"; then
+  # Only Mani's own answer counts: any other program on this port (a 404, an error page) must not look like "running".
+  STATUS=$(curl -sf -m 3 "http://127.0.0.1:$PORT/api/auth/status")
+  if echo "$STATUS" | grep -q '"setUp"'; then
     # Already running (for example started by hand in a terminal) — check again in a minute.
+    sleep 60
+    continue
+  fi
+  if curl -s -m 3 -o /dev/null "http://127.0.0.1:$PORT/"; then
+    echo "$(date -Is) port $PORT is used by another program, not Mani; retrying in 60 seconds" >> "$LOG"
     sleep 60
     continue
   fi

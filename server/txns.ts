@@ -1,4 +1,6 @@
 import { db, getAccount, payeeIdByName, rtaCategoryId, type AccountRow } from './db.ts';
+import { detectTransfers } from './transfers.ts';
+import { amazonInfoFor } from './amazon.ts';
 import { FLAGS, isCreditType, isValidISODate, addDays, type ISODate } from '../shared/util.ts';
 
 export class HttpError extends Error {
@@ -48,6 +50,7 @@ interface TxnRow {
   import_id: string | null;
   imported_payee: string | null;
   matched: number;
+  auto_transfer: number;
 }
 
 function validateCategory(id: number | null | undefined): number | null {
@@ -156,7 +159,9 @@ export const saveTransaction = db.transaction((input: TxnInput, existingId?: num
   // Transfer counterpart management.
   const oldCounterpart = existing?.transfer_txn_id ? getRow(existing.transfer_txn_id) : undefined;
   if (oldCounterpart && (!transferAcct || oldCounterpart.account_id !== transferAcct.id)) {
-    db.prepare(`DELETE FROM transactions WHERE id = ?`).run(oldCounterpart.id);
+    releaseCounterpart(oldCounterpart);
+    // The user separated these on purpose: never join them again automatically.
+    db.prepare(`UPDATE transactions SET auto_transfer = 0, no_auto_transfer = 1 WHERE id = ?`).run(id);
   }
   if (transferAcct) {
     const keep = oldCounterpart && oldCounterpart.account_id === transferAcct.id ? oldCounterpart : undefined;
@@ -166,14 +171,31 @@ export const saveTransaction = db.transaction((input: TxnInput, existingId?: num
       ).run(input.date, -input.amount, fields.memo, counterpartCategory, acct.id, id, keep.id);
       db.prepare(`UPDATE transactions SET transfer_txn_id=? WHERE id=?`).run(keep.id, id);
     } else {
-      const cid = Number(
-        db
-          .prepare(
-            `INSERT INTO transactions (account_id, date, amount, category_id, memo, cleared, approved, transfer_account_id, transfer_txn_id)
-             VALUES (?, ?, ?, ?, ?, 'uncleared', 1, ?, ?)`,
-          )
-          .run(transferAcct.id, input.date, -input.amount, counterpartCategory, fields.memo, acct.id, id).lastInsertRowid,
-      );
+      // If the other bank already sent its half of this transfer, use that instead of adding a duplicate.
+      const theirs = db
+        .prepare(
+          `SELECT id FROM transactions
+           WHERE account_id = ? AND amount = ? AND import_id IS NOT NULL AND matched = 0 AND transfer_account_id IS NULL
+             AND is_split = 0 AND id != ? AND date BETWEEN ? AND ?
+           ORDER BY abs(julianday(date) - julianday(?)), id LIMIT 1`,
+        )
+        .get(transferAcct.id, -input.amount, id, addDays(input.date, -7), addDays(input.date, 7), input.date) as { id: number } | undefined;
+      let cid: number;
+      if (theirs) {
+        cid = theirs.id;
+        db.prepare(
+          `UPDATE transactions SET category_id = ?, transfer_account_id = ?, transfer_txn_id = ?, payee_id = NULL, no_auto_transfer = 0 WHERE id = ?`,
+        ).run(counterpartCategory, acct.id, id, cid);
+      } else {
+        cid = Number(
+          db
+            .prepare(
+              `INSERT INTO transactions (account_id, date, amount, category_id, memo, cleared, approved, transfer_account_id, transfer_txn_id)
+               VALUES (?, ?, ?, ?, ?, 'uncleared', 1, ?, ?)`,
+            )
+            .run(transferAcct.id, input.date, -input.amount, counterpartCategory, fields.memo, acct.id, id).lastInsertRowid,
+        );
+      }
       db.prepare(`UPDATE transactions SET transfer_txn_id=? WHERE id=?`).run(cid, id);
     }
   } else {
@@ -198,9 +220,35 @@ export const saveTransaction = db.transaction((input: TxnInput, existingId?: num
 export const deleteTransaction = db.transaction((id: number) => {
   const row = getRow(id);
   if (!row) throw new HttpError(404, 'Transaction not found');
-  if (row.transfer_txn_id) db.prepare(`DELETE FROM transactions WHERE id = ?`).run(row.transfer_txn_id);
+  const other = row.transfer_txn_id ? getRow(row.transfer_txn_id) : undefined;
+  if (other) releaseCounterpart(other);
   db.prepare(`DELETE FROM transactions WHERE id = ?`).run(id);
 });
+
+/** Splits a transfer the app joined automatically back into the two separate bank transactions. */
+export const separateTransfer = db.transaction((id: number) => {
+  const row = getRow(id);
+  if (!row || !row.transfer_txn_id) return;
+  const other = getRow(row.transfer_txn_id);
+  if (other) releaseCounterpart(other);
+  if (row.import_id) releaseCounterpart(row);
+  else db.prepare(`UPDATE transactions SET transfer_account_id = NULL, transfer_txn_id = NULL WHERE id = ?`).run(id);
+});
+
+/**
+ * The other half of a transfer that is being removed or re-pointed. One the app made up is deleted with it; one your bank
+ * sent stays (it really happened) and goes back to being an ordinary transaction for you to review.
+ */
+function releaseCounterpart(other: TxnRow) {
+  if (!other.import_id) {
+    db.prepare(`DELETE FROM transactions WHERE id = ?`).run(other.id);
+    return;
+  }
+  db.prepare(
+    `UPDATE transactions SET transfer_account_id = NULL, transfer_txn_id = NULL, category_id = NULL, payee_id = ?, approved = 0,
+       auto_transfer = 0, no_auto_transfer = 1 WHERE id = ?`,
+  ).run(payeeIdByName(cleanPayee(other.imported_payee || 'Unknown')), other.id);
+}
 
 export interface TxnFilter {
   accountId?: number;
@@ -263,6 +311,7 @@ export function listTransactions(f: TxnFilter) {
       subsBy.get(s.transaction_id)!.push({ id: s.id, amount: s.amount, categoryId: s.category_id, categoryName: s.category_name, memo: s.memo });
     }
   }
+  const amazon = amazonInfoFor(rows.map((r) => r.id));
   return rows.map((r) => ({
     id: r.id,
     accountId: r.account_id,
@@ -287,6 +336,8 @@ export function listTransactions(f: TxnFilter) {
     importId: r.import_id,
     importedPayee: r.imported_payee,
     matched: !!r.matched,
+    autoTransfer: !!r.auto_transfer,
+    amazon: amazon.get(r.id) ?? null,
   }));
 }
 
@@ -297,11 +348,19 @@ export function accountBalances() {
          COALESCE(SUM(t.amount), 0) AS working,
          COALESCE(SUM(CASE WHEN t.cleared != 'uncleared' THEN t.amount ELSE 0 END), 0) AS cleared,
          COALESCE(SUM(CASE WHEN t.cleared = 'uncleared' THEN t.amount ELSE 0 END), 0) AS uncleared,
-         COALESCE(SUM(CASE WHEN t.approved = 0 THEN 1 ELSE 0 END), 0) AS unapproved
+         COALESCE(SUM(CASE WHEN t.approved = 0 THEN 1 ELSE 0 END), 0) AS unapproved,
+         -- Everything the user still has to look at: not yet approved, or missing a category (same rule as the budget's
+         -- uncategorized count). One number so there is a single place to review.
+         COALESCE(SUM(CASE WHEN t.approved = 0 OR (
+           a.on_budget = 1 AND t.is_split = 0 AND t.category_id IS NULL
+           AND (t.transfer_account_id IS NULL OR b.on_budget = 0)
+           AND NOT (a.type IN ('credit_card','line_of_credit') AND COALESCE(t.payee_id = (SELECT id FROM payees WHERE name = 'Starting Balance'), 0))
+         ) THEN 1 ELSE 0 END), 0) AS review
        FROM accounts a LEFT JOIN transactions t ON t.account_id = a.id
+       LEFT JOIN accounts b ON b.id = t.transfer_account_id
        GROUP BY a.id`,
     )
-    .all() as { id: number; working: number; cleared: number; uncleared: number; unapproved: number }[];
+    .all() as { id: number; working: number; cleared: number; uncleared: number; unapproved: number; review: number }[];
 }
 
 // ---------------- Imports (bank sync and file import share this path) ----------------
@@ -342,8 +401,9 @@ export function cleanPayee(raw: string): string {
 
 export const importTransactions = db.transaction((accountId: number, items: ImportItem[]) => {
   const acct = mustAccount(accountId);
-  const result = { imported: 0, matched: 0, skipped: 0 };
-  const exists = db.prepare(`SELECT id FROM transactions WHERE account_id = ? AND import_id = ?`);
+  const result = { imported: 0, matched: 0, skipped: 0, newIds: [] as number[] };
+  // A bank record the user un-matched lives on as "<id>:unmatched"; it still counts as imported.
+  const exists = db.prepare(`SELECT id FROM transactions WHERE account_id = ? AND import_id IN (?, ? || ':unmatched')`);
   const findMatch = db.prepare(
     `SELECT id FROM transactions
      WHERE account_id = ? AND import_id IS NULL AND amount = ? AND date BETWEEN ? AND ? AND cleared != 'reconciled'
@@ -358,7 +418,7 @@ export const importTransactions = db.transaction((accountId: number, items: Impo
       result.skipped++;
       continue;
     }
-    if (exists.get(acct.id, it.importId)) {
+    if (exists.get(acct.id, it.importId, it.importId)) {
       result.skipped++;
       continue;
     }
@@ -385,13 +445,17 @@ export const importTransactions = db.transaction((accountId: number, items: Impo
         if (!c || c.kind === 'cc_payment' || (c.kind === 'income' && it.amount < 0)) categoryId = null;
       }
     }
-    db.prepare(
-      `INSERT INTO transactions (account_id, date, amount, payee_id, category_id, memo, cleared, approved, import_id, imported_payee)
-       VALUES (?, ?, ?, ?, ?, ?, 'cleared', 0, ?, ?)`,
-    ).run(acct.id, it.date, it.amount, payeeId, categoryId, (it.memo ?? '').slice(0, 500), it.importId, it.payeeName);
+    const ins = db
+      .prepare(
+        `INSERT INTO transactions (account_id, date, amount, payee_id, category_id, memo, cleared, approved, import_id, imported_payee)
+         VALUES (?, ?, ?, ?, ?, ?, 'cleared', 0, ?, ?)`,
+      )
+      .run(acct.id, it.date, it.amount, payeeId, categoryId, (it.memo ?? '').slice(0, 500), it.importId, it.payeeName);
+    result.newIds.push(Number(ins.lastInsertRowid));
     result.imported++;
   }
   db.prepare(`UPDATE accounts SET last_import_at = datetime('now') WHERE id = ?`).run(acct.id);
+  if (result.imported) detectTransfers();
   return result;
 });
 

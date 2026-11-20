@@ -22,7 +22,7 @@ export default function Sidebar({ onNavigate, onLogout }: { onNavigate: () => vo
   const sections = ['Cash', 'Credit', 'Loans', 'Tracking']
     .map((name) => ({ name, accounts: open.filter((a) => sectionOf(a) === name) }))
     .filter((s) => s.accounts.length);
-  const unapproved = data.accounts.reduce((s, a) => s + a.unapprovedCount, 0);
+  const unapproved = data.accounts.reduce((s, a) => s + a.reviewCount, 0);
   const total = open.reduce((s, a) => s + a.balance, 0);
 
   return (
@@ -41,9 +41,12 @@ export default function Sidebar({ onNavigate, onLogout }: { onNavigate: () => vo
         <NavLink to="/reports" className="nav-item">
           <span className="nav-icon">◔</span> Reports
         </NavLink>
+        <NavLink to="/review" className="nav-item">
+          <span className="nav-icon">✓</span> Review
+          {unapproved > 0 && <span className="badge">{unapproved}</span>}
+        </NavLink>
         <NavLink to="/accounts" end className="nav-item">
           <span className="nav-icon">≡</span> All Accounts
-          {unapproved > 0 && <span className="badge">{unapproved}</span>}
         </NavLink>
       </nav>
 
@@ -75,7 +78,6 @@ export default function Sidebar({ onNavigate, onLogout }: { onNavigate: () => vo
                         />
                       )}
                       {a.name}
-                      {a.unapprovedCount > 0 && <span className="badge">{a.unapprovedCount}</span>}
                     </span>
                     <span className={a.balance < 0 ? 'neg' : ''}>{money(a.balance)}</span>
                   </NavLink>
@@ -116,6 +118,9 @@ export default function Sidebar({ onNavigate, onLogout }: { onNavigate: () => vo
       </button>
 
       <nav className="nav nav-bottom" onClick={onNavigate}>
+        <NavLink to="/plan" className="nav-item small">
+          Monthly Plan
+        </NavLink>
         <NavLink to="/scheduled" className="nav-item small">
           Scheduled
         </NavLink>

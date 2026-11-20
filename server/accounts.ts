@@ -53,7 +53,14 @@ export function updateAccount(id: number, patch: { name?: string; note?: string;
     db.prepare(`UPDATE categories SET name = ? WHERE kind = 'cc_payment' AND linked_account_id = ?`).run(name, id);
   }
   if (patch.note !== undefined) db.prepare(`UPDATE accounts SET note = ? WHERE id = ?`).run(patch.note, id);
-  if (patch.closed !== undefined) db.prepare(`UPDATE accounts SET closed = ? WHERE id = ?`).run(patch.closed ? 1 : 0, id);
+  if (patch.closed !== undefined) {
+    const before = db.prepare(`SELECT closed, connection_id FROM accounts WHERE id = ?`).get(id) as { closed: number; connection_id: number | null } | undefined;
+    db.prepare(`UPDATE accounts SET closed = ? WHERE id = ?`).run(patch.closed ? 1 : 0, id);
+    // Closed accounts are skipped by bank sync. On reopening, re-read the bank's history so the gap is filled in.
+    if (before?.closed && !patch.closed && before.connection_id) {
+      db.prepare(`UPDATE connections SET cursor = NULL WHERE id = ? AND provider = 'plaid'`).run(before.connection_id);
+    }
+  }
 }
 
 export const deleteAccount = db.transaction((id: number) => {
@@ -76,10 +83,10 @@ export const deleteAccount = db.transaction((id: number) => {
 export function listAccounts() {
   return db
     .prepare(
-      `SELECT a.*, c.provider, c.institution, c.status AS connection_status, c.error AS connection_error
+      `SELECT a.*, c.provider, c.institution, c.status AS connection_status, c.error AS connection_error, c.last_sync_at AS connection_last_sync
        FROM accounts a LEFT JOIN connections c ON c.id = a.connection_id ORDER BY a.sort, a.id`,
     )
-    .all() as (AccountRow & { provider: string | null; institution: string | null; connection_status: string | null; connection_error: string | null })[];
+    .all() as (AccountRow & { provider: string | null; institution: string | null; connection_status: string | null; connection_error: string | null; connection_last_sync: string | null })[];
 }
 
 /**

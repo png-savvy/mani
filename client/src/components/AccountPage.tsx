@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useParams, useSearchParams, Link } from 'react-router-dom';
+import { Navigate, useParams, useSearchParams, Link } from 'react-router-dom';
 import { api } from '../api';
 import { useApp } from '../store';
 import { fmtDate, fmtMonth, money, timeAgo } from '../format';
@@ -7,24 +7,36 @@ import { CategorySelect, Confirm, Sheet } from './ui';
 import CategoryPicker from './CategoryPicker';
 import { useIsMobile } from '../hooks';
 import TxnEditor from './TxnEditor';
+import AmazonItems, { displayMemo } from './AmazonItems';
 import ReconcileModal from './ReconcileModal';
 import FileImportModal from './FileImportModal';
 import AccountSettingsModal from './AccountSettingsModal';
 import { ConnectBankModal } from './ConnectBank';
-import type { Account, Scheduled, Txn } from '../types';
-import { FREQUENCY_LABELS, type Frequency } from '../../../shared/util';
+import type { Account, BudgetMonth, Scheduled, Txn } from '../types';
+import { FREQUENCY_LABELS, currentMonth, type Frequency } from '../../../shared/util';
 
 const PAGE = 300;
 
-export default function AccountPage() {
+/** What the server reports after categorizing: balances before/after, and what's needed to undo it. */
+interface Categorized {
+  to: { id: number; name: string; before: number; after: number } | null;
+  from: { id: number; name: string; before: number; after: number } | null;
+  undo: unknown;
+}
+
+/** The register for one account, all accounts, a category — or, with `review`, everything from every account still to review. */
+export default function AccountPage({ review = false }: { review?: boolean }) {
   const params = useParams();
   const [search] = useSearchParams();
-  const accountId = params.accountId ? Number(params.accountId) : null;
+  const accountId = params.accountId && !review ? Number(params.accountId) : null;
   const categoryId = search.get('categoryId') ? Number(search.get('categoryId')) : null;
   const month = search.get('month');
-  const uncategorizedOnly = search.get('uncategorized') === '1';
+  // One review list for all accounts: everything not yet approved or still missing a category (at /review).
+  const legacyReviewLink = !review && (search.get('review') === '1' || search.get('uncategorized') === '1' || search.get('unapproved') === '1');
+  const reviewOnly = review;
   const { data, version, run, toast } = useApp();
-  const account = data.accounts.find((a) => a.id === accountId) ?? null;
+  const account = review ? null : (data.accounts.find((a) => a.id === accountId) ?? null);
+  const totalToReview = data.accounts.reduce((s, a) => s + a.reviewCount, 0);
 
   const [txns, setTxns] = useState<Txn[] | null>(null);
   const [scheduled, setScheduled] = useState<Scheduled[]>([]);
@@ -35,8 +47,16 @@ export default function AccountPage() {
   const [modal, setModal] = useState<'reconcile' | 'file' | 'settings' | 'link' | 'delete' | null>(null);
   const [bulkCat, setBulkCat] = useState<number | null>(null);
   const [importing, setImporting] = useState(false);
-  const [showUnapprovedOnly, setShowUnapprovedOnly] = useState(search.get('unapproved') === '1');
   const [pickFor, setPickFor] = useState<Txn | null>(null);
+  // In the review list, each category's current balance is shown next to it.
+  const [catBalances, setCatBalances] = useState<Map<number, number>>(new Map());
+  useEffect(() => {
+    if (!review) return;
+    api
+      .get<BudgetMonth>(`/budget/${currentMonth()}`)
+      .then((v) => setCatBalances(new Map(v.groups.flatMap((g) => g.categories.map((c) => [c.id, c.available] as const)))))
+      .catch(() => {});
+  }, [review, version]);
   const isMobile = useIsMobile();
 
   const load = useCallback(() => {
@@ -60,25 +80,39 @@ export default function AccountPage() {
 
   const accountsById = useMemo(() => new Map(data.accounts.map((a) => [a.id, a])), [data.accounts]);
 
+  /** On-budget spending with no category yet: it can't be approved until it has one. */
+  const needsCategory = useCallback(
+    (t: Txn) => {
+      const acct = accountsById.get(t.accountId);
+      const other = t.transferAccountId ? accountsById.get(t.transferAccountId) : null;
+      if (!acct?.onBudget || t.isSplit || t.categoryId !== null || (other && other.onBudget)) return false;
+      return !(t.payeeName === 'Starting Balance' && (acct.type === 'credit_card' || acct.type === 'line_of_credit'));
+    },
+    [accountsById],
+  );
+
+  const needsReview = useCallback(
+    (t: Txn) => {
+      if (!t.approved) return true;
+      return needsCategory(t);
+    },
+    [needsCategory],
+  );
+
   const filtered = useMemo(() => {
     if (!txns) return [];
     const q = query.trim().toLowerCase();
     return txns.filter((t) => {
-      if (showUnapprovedOnly && t.approved) return false;
-      if (uncategorizedOnly) {
-        const acct = accountsById.get(t.accountId);
-        const other = t.transferAccountId ? accountsById.get(t.transferAccountId) : null;
-        if (!acct?.onBudget || t.isSplit || t.categoryId !== null || (other && other.onBudget)) return false;
-        if (t.payeeName === 'Starting Balance' && (acct.type === 'credit_card' || acct.type === 'line_of_credit')) return false;
-      }
+      if (reviewOnly && !needsReview(t)) return false;
       if (!q) return true;
       return [t.payeeName, t.memo, t.categoryName, t.transferAccountName, t.importedPayee, t.accountName, (Math.abs(t.amount) / 100).toFixed(2)]
         .filter(Boolean)
         .some((s) => String(s).toLowerCase().includes(q));
     });
-  }, [txns, query, showUnapprovedOnly, uncategorizedOnly, accountsById]);
+  }, [txns, query, reviewOnly, needsReview]);
 
-  const unapproved = (txns ?? []).filter((t) => !t.approved);
+  // Approving is only offered once a transaction has a category (or doesn't need one).
+  const unapproved = (txns ?? []).filter((t) => !t.approved && !needsCategory(t));
   const upcoming = scheduled.filter((s) => !accountId || s.accountId === accountId || s.transferAccountId === accountId);
   const categoryName = categoryId ? data.categories.find((c) => c.id === categoryId)?.name : null;
 
@@ -86,8 +120,8 @@ export default function AccountPage() {
     ? account.name
     : categoryName
       ? `${categoryName}${month ? ` · ${fmtMonth(month)}` : ''}`
-      : uncategorizedOnly
-        ? 'Uncategorized transactions'
+      : reviewOnly
+        ? 'Review'
         : 'All Accounts';
 
   const visibleAccounts = data.accounts.filter((a) => !a.closed);
@@ -96,6 +130,30 @@ export default function AccountPage() {
 
   const bulk = (action: string, extra: Record<string, unknown> = {}) =>
     run(() => api.post('/transactions/bulk', { ids: [...selected], action, ...extra })).then(() => setSelected(new Set()));
+
+  /** Categorizes from a list (also approves), or with null takes the category off. Shows what it did, with a way back. */
+  const categorize = async (t: Txn, categoryId: number | null) => {
+    setPickFor(null);
+    const r = await run(() => api.post<Categorized>(`/transactions/${t.id}/categorize`, { categoryId }));
+    if (!r) return;
+    // Approving a transaction that already had this category doesn't move the balance: show where it stands instead.
+    const line = (c: NonNullable<Categorized['to']>) =>
+      c.before === c.after ? `Approved · ${c.name}: ${money(c.after)}` : `${c.name}: ${money(c.before)} → ${money(c.after)}`;
+    const lines = [r.to && categoryId !== null ? null : r.to, r.from].filter(Boolean).map((c) => line(c!));
+    // Red when the category it went into is now overspent.
+    toast(categoryId === null ? 'Sent back to review' : r.to ? line(r.to) : 'Categorized', categoryId !== null && r.to && r.to.after < 0 ? 'error' : 'success', {
+      lines: lines.length ? lines : undefined,
+      duration: 2000,
+      action: { label: 'Undo', onClick: () => run(() => api.post(`/transactions/${t.id}/undo-categorize`, { undo: r.undo }), 'Put back') },
+    });
+  };
+
+  /** Approves one transaction, showing its category's balance and a way back when it has one. */
+  const approve = (t: Txn) => {
+    const other = t.transferAccountId ? accountsById.get(t.transferAccountId) : null;
+    if (t.categoryId !== null && !t.isSplit && accountsById.get(t.accountId)?.onBudget && !other?.onBudget) return categorize(t, t.categoryId);
+    return run(() => api.post('/transactions/bulk', { ids: [t.id], action: 'approve' }), 'Approved');
+  };
 
   const toggleCleared = (t: Txn) => {
     if (t.cleared === 'reconciled') return toast('Reconciled transactions are locked. Edit the transaction to change it.', 'info');
@@ -120,6 +178,8 @@ export default function AccountPage() {
   const allSelected = shown.length > 0 && shown.every((t) => selected.has(t.id));
   const showAccountCol = !accountId;
 
+  if (legacyReviewLink && !accountId) return <Navigate to="/review" replace />;
+
   return (
     <div className="page account-page">
       <header className="acct-header">
@@ -129,7 +189,8 @@ export default function AccountPage() {
             <div className="acct-sub">
               {account.linked ? (
                 <span className={`link-status ${account.connectionStatus === 'ok' ? 'ok' : 'bad'}`}>
-                  ● Linked{account.institution ? ` to ${account.institution}` : ''} · last import {timeAgo(account.lastImportAt)}
+                  ● Linked{account.institution ? ` to ${account.institution}` : ''} · checked {timeAgo(account.lastCheckedAt)} · last new
+                  transactions {timeAgo(account.lastImportAt)}
                   {account.connectionStatus !== 'ok' && account.connectionError && <> — {account.connectionError} (<Link to="/settings">fix</Link>)</>}
                 </span>
               ) : (
@@ -139,13 +200,13 @@ export default function AccountPage() {
               {!account.onBudget && <span className="tag">Tracking</span>}
             </div>
           )}
-          {(categoryId || uncategorizedOnly) && (
+          {(categoryId || (reviewOnly && !account)) && (
             <div className="acct-sub">
               <Link to="/accounts">Show all transactions</Link>
             </div>
           )}
         </div>
-        {!categoryId && !uncategorizedOnly && (
+        {!categoryId && !reviewOnly && (
           <div className="balances">
             <div>
               <span className={cleared < 0 ? 'neg' : ''}>{money(cleared)}</span>
@@ -189,11 +250,13 @@ export default function AccountPage() {
         {account && <button className="btn btn-small" onClick={() => setModal('reconcile')}>Reconcile</button>}
         {account && <button className="btn btn-small btn-ghost" onClick={() => setModal('settings')} aria-label="Account settings">⚙ Edit Account</button>}
         <span className="spacer" />
+        {!reviewOnly && totalToReview > 0 && (
+          <Link className="chip" to="/review" title="Everything to review, from all your accounts">
+            {totalToReview} to review
+          </Link>
+        )}
         {unapproved.length > 0 && (
           <>
-            <button className={`chip ${showUnapprovedOnly ? 'active' : ''}`} onClick={() => setShowUnapprovedOnly((v) => !v)}>
-              {unapproved.length} to approve
-            </button>
             <button className="btn btn-small btn-success" onClick={() => run(() => api.post('/transactions/bulk', { ids: unapproved.map((t) => t.id), action: 'approve' }), 'Approved')}>
               Approve all
             </button>
@@ -212,6 +275,9 @@ export default function AccountPage() {
             <CategorySelect value={bulkCat} onChange={setBulkCat} noneLabel="Categorize as…" />
             <button className="btn btn-small" disabled={!bulkCat} onClick={() => bulk('categorize', { categoryId: bulkCat })}>Apply</button>
           </span>
+          <button className="btn btn-small" onClick={() => bulk('categorize', { categoryId: null })} title="Take the category off, sending these back to the review list">
+            Uncategorize
+          </button>
           <button className="btn btn-small btn-danger-ghost" onClick={() => setModal('delete')}>Delete</button>
           <button className="btn btn-small btn-ghost" onClick={() => setSelected(new Set())}>Clear selection</button>
         </div>
@@ -219,7 +285,7 @@ export default function AccountPage() {
 
       {isMobile ? (
         <div className="m-list">
-          {!categoryId && !uncategorizedOnly &&
+          {!categoryId && !reviewOnly &&
             upcoming.map((s) => (
               <div key={'s' + s.id} className="m-card scheduled">
                 <div className="m-card-main">
@@ -254,7 +320,9 @@ export default function AccountPage() {
               accounts={data.accounts}
               onEdit={() => setEditing(t.id)}
               onPickCategory={() => setPickFor(t)}
-              onApprove={() => run(() => api.post('/transactions/bulk', { ids: [t.id], action: 'approve' }))}
+              balance={t.categoryId !== null ? catBalances.get(t.categoryId) : undefined}
+              onApprove={() => approve(t)}
+              onSeparate={() => run(() => api.post('/transactions/bulk', { ids: [t.id], action: 'separate-transfer' }), 'Separated into two transactions')}
               onToggleCleared={() => toggleCleared(t)}
             />
           ))}
@@ -270,22 +338,6 @@ export default function AccountPage() {
                 onDone={() => setEditing(null)}
               />
             </Sheet>
-          )}
-          {pickFor && (
-            <CategoryPicker
-              value={pickFor.categoryId}
-              title={`${pickFor.payeeName ?? 'Transaction'} · ${money(pickFor.amount)}`}
-              onClose={() => setPickFor(null)}
-              onSelect={async (id) => {
-                const t = pickFor;
-                setPickFor(null);
-                // Categorizing from the list also approves it.
-                await run(async () => {
-                  await api.post('/transactions/bulk', { ids: [t.id], action: 'categorize', categoryId: id });
-                  await api.post('/transactions/bulk', { ids: [t.id], action: 'approve' });
-                });
-              }}
-            />
           )}
         </div>
       ) : (
@@ -314,7 +366,7 @@ export default function AccountPage() {
           <TxnEditor txn={null} accountId={accountId} showAccount={showAccountCol} onDone={() => setEditing(null)} />
         )}
 
-        {!categoryId && !uncategorizedOnly &&
+        {!categoryId && !reviewOnly &&
           upcoming.map((s) => (
             <div key={'s' + s.id} className={`reg-row scheduled ${showAccountCol ? 'with-acct' : ''}`}>
               <span />
@@ -371,9 +423,13 @@ export default function AccountPage() {
                 })
               }
               onEdit={() => setEditing(t.id)}
+              onPickCategory={() => setPickFor(t)}
+              quickCategory={reviewOnly}
+              balance={t.categoryId !== null ? catBalances.get(t.categoryId) : undefined}
               onToggleCleared={() => toggleCleared(t)}
-              onApprove={() => run(() => api.post('/transactions/bulk', { ids: [t.id], action: 'approve' }))}
+              onApprove={() => approve(t)}
               onUnmatch={() => run(() => api.post('/transactions/bulk', { ids: [t.id], action: 'reject-match' }), 'Unmatched')}
+              onSeparate={() => run(() => api.post('/transactions/bulk', { ids: [t.id], action: 'separate-transfer' }), 'Separated into two transactions')}
             />
           ),
         )}
@@ -385,6 +441,15 @@ export default function AccountPage() {
       </div>
       )}
 
+      {pickFor && (
+        <CategoryPicker
+          value={pickFor.categoryId}
+          title={`${pickFor.payeeName ?? 'Transaction'} · ${money(pickFor.amount)}`}
+          onClose={() => setPickFor(null)}
+          onSelect={(id) => categorize(pickFor, id)}
+          onClear={() => categorize(pickFor, null)}
+        />
+      )}
       {modal === 'reconcile' && account && <ReconcileModal account={account} onClose={() => setModal(null)} />}
       {modal === 'file' && account && <FileImportModal account={account} onClose={() => setModal(null)} />}
       {modal === 'settings' && account && <AccountSettingsModal account={account} onClose={() => setModal(null)} onLink={() => setModal('link')} />}
@@ -412,6 +477,10 @@ function TxnRow({
   onToggleCleared,
   onApprove,
   onUnmatch,
+  onSeparate,
+  onPickCategory,
+  quickCategory,
+  balance,
 }: {
   t: Txn;
   showAccount: boolean;
@@ -421,6 +490,12 @@ function TxnRow({
   onToggleCleared: () => void;
   onApprove: () => void;
   onUnmatch: () => void;
+  onSeparate: () => void;
+  onPickCategory: () => void;
+  /** In the review list, clicking the category picks one right there (and approves). */
+  quickCategory: boolean;
+  /** The category's current balance (review list only). */
+  balance?: number;
 }) {
   const { data } = useApp();
   const info = categoryInfo(t, data.accounts);
@@ -429,7 +504,7 @@ function TxnRow({
   return (
     <>
       <div
-        className={`reg-row ${showAccount ? 'with-acct' : ''} ${selected ? 'selected' : ''} ${!t.approved ? 'unapproved' : ''}`}
+        className={`reg-row ${showAccount ? 'with-acct' : ''} ${selected ? 'selected' : ''} ${!t.approved ? 'unapproved' : ''} ${t.amazon?.items.length ? 'has-amazon' : ''}`}
         onDoubleClick={onEdit}
       >
         <span onClick={(e) => e.stopPropagation()}>
@@ -441,15 +516,27 @@ function TxnRow({
         <span className="ellipsis" onClick={onEdit} title={t.importedPayee ? `Bank description: ${t.importedPayee}` : undefined}>
           {t.transferAccountName ? `Transfer : ${t.transferAccountName}` : t.payeeName ?? <span className="muted">—</span>}
         </span>
-        <span className="ellipsis" onClick={onEdit}>{category}</span>
+        <span
+          className={`ellipsis ${info.canPick && (quickCategory || info.needs) ? 'pickable' : ''}`}
+          onClick={info.canPick && (quickCategory || info.needs) ? onPickCategory : onEdit}
+          title={info.canPick && (quickCategory || info.needs) ? 'Choose a category' : undefined}
+        >
+          {category}
+          {balance !== undefined && <BalancePill balance={balance} />}
+        </span>
         <span className="ellipsis muted" onClick={onEdit}>
-          {t.memo}
+          {displayMemo(t)}
           {!t.approved && (
             <span className="approve-inline" onClick={(e) => e.stopPropagation()}>
               {t.matched && <span className="tag tag-match" title={`Matched with imported "${t.importedPayee}"`}>Matched</span>}
-              {!t.matched && t.importId && <span className="tag">Imported</span>}
-              <button className="btn btn-tiny btn-success" onClick={onApprove}>Approve</button>
+              {t.autoTransfer && t.transferAccountId ? (
+                <span className="tag tag-match" title={`Bank description: ${t.importedPayee ?? ''}`}>Transfer found</span>
+              ) : (
+                !t.matched && t.importId && <span className="tag">Imported</span>
+              )}
+              {!info.needs && <button className="btn btn-tiny btn-success" onClick={onApprove}>Approve</button>}
               {t.matched && <button className="btn btn-tiny btn-ghost" onClick={onUnmatch}>Unmatch</button>}
+              {t.autoTransfer && t.transferAccountId && <button className="btn btn-tiny btn-ghost" onClick={onSeparate}>Not a transfer</button>}
             </span>
           )}
         </span>
@@ -466,6 +553,11 @@ function TxnRow({
           </button>
         </span>
       </div>
+      {t.amazon && t.amazon.items.length > 0 && (
+        <div className={`reg-amazon ${!t.approved ? 'unapproved' : ''}`} onClick={onEdit}>
+          <AmazonItems t={t} />
+        </div>
+      )}
       {t.isSplit &&
         t.subtransactions.map((s, i) => (
           <div key={i} className={`reg-row sub ${showAccount ? 'with-acct' : ''}`} onClick={onEdit}>
@@ -482,6 +574,15 @@ function TxnRow({
           </div>
         ))}
     </>
+  );
+}
+
+/** A category's current balance, shown beside its name in the review list. */
+function BalancePill({ balance }: { balance: number }) {
+  return (
+    <span className={`pill cat-balance ${balance < 0 ? 'pill-neg' : balance > 0 ? 'pill-pos' : 'pill-zero'}`} title="This category's balance now">
+      {money(balance)}
+    </span>
   );
 }
 
@@ -504,7 +605,9 @@ function MobileTxnCard({
   accounts,
   onEdit,
   onPickCategory,
+  balance,
   onApprove,
+  onSeparate,
   onToggleCleared,
 }: {
   t: Txn;
@@ -512,7 +615,9 @@ function MobileTxnCard({
   accounts: Account[];
   onEdit: () => void;
   onPickCategory: () => void;
+  balance?: number;
   onApprove: () => void;
+  onSeparate: () => void;
   onToggleCleared: () => void;
 }) {
   const info = categoryInfo(t, accounts);
@@ -535,6 +640,7 @@ function MobileTxnCard({
               }}
             >
               {info.text} ▾
+              {balance !== undefined && <BalancePill balance={balance} />}
             </button>
           ) : (
             <span className={info.muted ? 'muted' : ''}>{info.text}</span>
@@ -555,11 +661,20 @@ function MobileTxnCard({
           </button>
         </span>
       </div>
-      {t.memo && <div className="m-memo">{t.memo}</div>}
+      <AmazonItems t={t} className="m-memo" />
+      {displayMemo(t) && <div className="m-memo">{displayMemo(t)}</div>}
       {!t.approved && (
         <div className="m-approve" onClick={(e) => e.stopPropagation()}>
-          <span className="small muted">{t.matched ? 'Matched with bank import' : 'Imported'} — review and approve</span>
-          <button className="btn btn-small btn-success" onClick={onApprove}>Approve</button>
+          <span className="small muted">
+            {t.autoTransfer && t.transferAccountId ? 'Transfer between your accounts' : t.matched ? 'Matched with bank import' : 'Imported'} —{' '}
+            {info.needs ? 'choose a category to approve' : 'review and approve'}
+          </span>
+          {t.autoTransfer && t.transferAccountId && <button className="btn btn-small btn-ghost" onClick={onSeparate}>Not a transfer</button>}
+          {info.needs ? (
+            <button className="btn btn-small" onClick={onPickCategory}>Choose category</button>
+          ) : (
+            <button className="btn btn-small btn-success" onClick={onApprove}>Approve</button>
+          )}
         </div>
       )}
     </div>

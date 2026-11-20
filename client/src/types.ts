@@ -12,13 +12,18 @@ export interface Account {
   institution: string | null;
   connectionStatus: string | null;
   connectionError: string | null;
+  /** When new transactions last arrived for this account. */
   lastImportAt: string | null;
+  /** When the bank was last checked for this account (whether or not anything new came in). */
+  lastCheckedAt: string | null;
   bankBalance: number | null;
   importStart: string | null;
   balance: number;
   clearedBalance: number;
   unclearedBalance: number;
   unapprovedCount: number;
+  /** Transactions needing attention: not yet approved, or missing a category. */
+  reviewCount: number;
 }
 
 export interface Group {
@@ -52,6 +57,7 @@ export interface Settings {
   dateFormat: string;
   syncIntervalHours: number;
   budgetMode: 'rolling' | 'monthly';
+  showCcPayments: boolean;
 }
 
 export interface Bootstrap {
@@ -96,6 +102,10 @@ export interface Txn {
   importId: string | null;
   importedPayee: string | null;
   matched: boolean;
+  /** A transfer the app joined automatically from two bank transactions. */
+  autoTransfer: boolean;
+  /** Amazon order this bank charge was matched to by the Mani Amazon extension. */
+  amazon: { orderId: string; items: string[] } | null;
 }
 
 export interface TargetStatus {
@@ -148,6 +158,15 @@ export interface BudgetMonth {
   groups: BudgetGroup[];
   uncategorizedCount: number;
   ageOfMoney: number | null;
+  plan: { income: number; total: number; categories: number; appliedAt: string | null; canApply: boolean };
+}
+
+export interface PlanPreview {
+  month: string;
+  rows: { categoryId: number; name: string; groupName: string; plan: number; percent: number | null; current: number; next: number }[];
+  planTotal: number;
+  addedTotal: number;
+  appliedAt: string | null;
 }
 
 export interface Scheduled {

@@ -3,7 +3,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export const DATA_DIR = path.resolve(process.env.DATA_DIR || './data');
-fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+try {
+  // Your budget and bank connection details live here: keep other accounts on this computer out.
+  fs.chmodSync(DATA_DIR, 0o700);
+} catch {
+  // Some file systems (Windows drives, certain Docker mounts) don't support this; nothing to do.
+}
 
 export const DB_PATH = path.join(DATA_DIR, process.env.DB_FILE || 'budget.db');
 
@@ -167,6 +173,45 @@ function addColumn(table: string, column: string, ddl: string) {
 // balance until the bank has delivered all history (Plaid fetches it in the background after linking).
 addColumn('accounts', 'opening_txn_id', 'INTEGER');
 addColumn('accounts', 'opening_auto', 'INTEGER NOT NULL DEFAULT 0');
+// Monthly plan: a fixed amount per category, assigned in one click each month (see plan.ts).
+addColumn('categories', 'plan_amount', 'INTEGER NOT NULL DEFAULT 0');
+// When set, the plan amount is this share of the monthly income instead, in hundredths of a percent (1000 = 10%).
+addColumn('categories', 'plan_percent', 'INTEGER');
+// Transfers joined automatically from two imported halves (see transfers.ts); no_auto_transfer marks halves the user
+// separated again, so they are never re-joined.
+addColumn('transactions', 'auto_transfer', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('transactions', 'no_auto_transfer', 'INTEGER NOT NULL DEFAULT 0');
+// Amazon order details sent by the Mani Amazon extension (see amazon.ts).
+db.exec(`CREATE TABLE IF NOT EXISTS amazon_orders (
+  order_id TEXT PRIMARY KEY,
+  order_date TEXT,
+  items TEXT NOT NULL DEFAULT '[]',
+  fetched_at TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS amazon_charges (
+  id INTEGER PRIMARY KEY,
+  order_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  amount INTEGER NOT NULL,
+  last4 TEXT,
+  txn_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
+  UNIQUE(order_id, date, amount)
+)`);
+// Order totals from Amazon's order list, and charges Mani worked out from them (estimated = 1) for orders Amazon's
+// payments page no longer shows.
+addColumn('amazon_orders', 'total', 'INTEGER');
+addColumn('amazon_charges', 'estimated', 'INTEGER NOT NULL DEFAULT 0');
+// Devices that asked for push notifications (see push.ts).
+db.exec(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id INTEGER PRIMARY KEY,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_ok_at TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS plan_applied (month TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`);
 
 export const SYSTEM_GROUP_INTERNAL = 'internal';
 export const SYSTEM_GROUP_CC = 'credit_card_payments';

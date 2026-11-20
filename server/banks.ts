@@ -2,6 +2,9 @@ import { db, getAccount, getSetting } from './db.ts';
 import { decrypt, encrypt } from './security.ts';
 import { HttpError, createStartingBalance, importTransactions, removeImported, startingBalanceCategory, type ImportItem } from './txns.ts';
 import { createAccount } from './accounts.ts';
+import { detectTransfers } from './transfers.ts';
+import { matchAmazon } from './amazon.ts';
+import { notifyNewTransactions } from './push.ts';
 import { addDays, decimalToCents, formatISODate, isValidISODate, todayISO, type ISODate } from '../shared/util.ts';
 
 // =====================================================================================
@@ -32,19 +35,37 @@ class PlaidError extends Error {
   }
 }
 
+/** Every bank request gets a deadline: a hung connection must fail (and be retried) rather than block all later syncs. */
+const REQUEST_TIMEOUT_MS = 30000;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function plaidPost<T = any>(path: string, body: Record<string, unknown>): Promise<T> {
   const cfg = plaidConfig();
   if (!cfg.configured) throw new HttpError(400, 'Plaid is not configured. Set PLAID_CLIENT_ID and PLAID_SECRET (see README).');
-  const res = await fetch(cfg.baseUrl + path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ client_id: cfg.clientId, secret: cfg.secret, ...body }),
-  });
-  const json = (await res.json().catch(() => ({}))) as any;
-  if (!res.ok) {
+  // Everything we send Plaid is safe to repeat, so ride out network blips, rate limits and Plaid-side errors.
+  for (let attempt = 0; ; attempt++) {
+    const last = attempt >= 3;
+    let res: Response;
+    try {
+      res = await fetch(cfg.baseUrl + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client_id: cfg.clientId, secret: cfg.secret, ...body }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (e) {
+      if (last) throw new PlaidError('NETWORK_ERROR', `Could not reach Plaid: ${(e as Error).message}`);
+      await sleep(1000 * 2 ** attempt);
+      continue;
+    }
+    const json = (await res.json().catch(() => ({}))) as any;
+    if (res.ok) return json as T;
+    if ((res.status === 429 || res.status >= 500) && !last) {
+      await sleep(1000 * 2 ** attempt);
+      continue;
+    }
     throw new PlaidError(json.error_code || 'PLAID_ERROR', json.display_message || json.error_message || `Plaid error ${res.status}`);
   }
-  return json as T;
 }
 
 export async function plaidLinkToken(connectionId?: number): Promise<string> {
@@ -75,7 +96,8 @@ export async function plaidExchange(publicToken: string, institution: string): P
   let id: number;
   if (existing) {
     id = existing.id;
-    db.prepare(`UPDATE connections SET secret_enc = ?, status = 'ok', error = NULL WHERE id = ?`).run(encrypt(r.access_token), id);
+    // A cursor belongs to the access token it was issued for; start over (imports are deduplicated by id).
+    db.prepare(`UPDATE connections SET secret_enc = ?, cursor = NULL, status = 'ok', error = NULL WHERE id = ?`).run(encrypt(r.access_token), id);
   } else {
     id = Number(
       db
@@ -106,7 +128,7 @@ async function refreshPlaidAccounts(connId: number) {
 async function syncPlaid(connId: number) {
   const conn = getConnection(connId);
   const accessToken = decrypt(conn.secret_enc);
-  const startCursor = conn.cursor || undefined;
+  let startCursor = conn.cursor || undefined;
   let added: any[] = [];
   let modified: any[] = [];
   let removed: any[] = [];
@@ -132,6 +154,12 @@ async function syncPlaid(connId: number) {
     } catch (e) {
       // Plaid asks clients to restart pagination from the original cursor in this case.
       if (e instanceof PlaidError && e.code === 'TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION' && attempt < 2) continue;
+      // A cursor Plaid no longer accepts would otherwise fail forever. Start over from the beginning instead:
+      // imports are deduplicated by transaction id, so nothing is doubled and nothing is lost.
+      if (e instanceof PlaidError && startCursor && /cursor/i.test(e.message) && attempt < 2) {
+        startCursor = undefined;
+        continue;
+      }
       throw e;
     }
   }
@@ -139,7 +167,9 @@ async function syncPlaid(connId: number) {
   const mapped = linkedAccounts(connId);
   const byExternal = new Map(mapped.map((a) => [a.external_id!, a.id]));
   const items = new Map<number, ImportItem[]>();
-  for (const t of added) {
+  // "Modified" transactions go through the import path too: one we don't have yet (e.g. it was still pending the first
+  // time we saw it) must be added, not dropped. Ones we already have are skipped there and updated below.
+  for (const t of [...added, ...modified]) {
     if (t.pending) continue; // Only import posted transactions; pending ones come back as posted later.
     const local = byExternal.get(t.account_id);
     if (!local) continue;
@@ -151,9 +181,10 @@ async function syncPlaid(connId: number) {
       payeeName: t.merchant_name || t.name || 'Unknown',
     });
   }
-  const totals = { imported: 0, matched: 0, skipped: 0 };
+  const totals = { imported: 0, matched: 0, skipped: 0, newIds: [] as number[] };
   for (const [acctId, list] of items) {
     const r = importTransactions(acctId, list);
+    totals.newIds.push(...r.newIds);
     totals.imported += r.imported;
     totals.matched += r.matched;
     totals.skipped += r.skipped;
@@ -169,6 +200,8 @@ async function syncPlaid(connId: number) {
     for (const a of mapped) removeImported(a.id, `plaid:${t.transaction_id}`);
   }
   db.prepare(`UPDATE connections SET cursor = ? WHERE id = ?`).run(cursor ?? null, connId);
+  // Until Plaid has finished pulling history from the bank, more is on its way: check back soon instead of in hours.
+  if (updateStatus && updateStatus !== 'HISTORICAL_UPDATE_COMPLETE') retrySoon.add(connId);
   await refreshPlaidAccounts(connId);
   // Plaid pulls ~30 days right after linking, then older history in the background.
   const monthAgo = addDays(todayISO(), -30);
@@ -243,7 +276,7 @@ export async function simplefinClaim(setupToken: string): Promise<number> {
 async function simplefinFetch(accessUrl: string, params: Record<string, string>) {
   const { base, auth } = splitAccessUrl(accessUrl);
   const qs = new URLSearchParams(params).toString();
-  const res = await fetch(`${base}/accounts${qs ? '?' + qs : ''}`, { headers: { Authorization: auth } });
+  const res = await fetch(`${base}/accounts${qs ? '?' + qs : ''}`, { headers: { Authorization: auth }, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS * 2) });
   if (res.status === 403) throw new HttpError(400, 'SimpleFIN access was revoked or is invalid. Reconnect with a new Setup Token.');
   if (res.status === 402) throw new HttpError(400, 'Your SimpleFIN Bridge subscription needs payment.');
   if (!res.ok) throw new HttpError(502, `SimpleFIN request failed (HTTP ${res.status})`);
@@ -281,7 +314,7 @@ async function syncSimplefin(connId: number, accountsOnly = false) {
   }
 
   const byExternal = new Map(mapped.map((a) => [a.external_id!, a.id]));
-  const totals = { imported: 0, matched: 0, skipped: 0, warnings: [] as string[] };
+  const totals = { imported: 0, matched: 0, skipped: 0, newIds: [] as number[], warnings: [] as string[] };
   const institutions = new Set<string>();
   // Newest window last so the balance we keep is the current one.
   for (const params of windows) {
@@ -306,6 +339,7 @@ async function syncSimplefin(connId: number, accountsOnly = false) {
         });
       }
       const r = importTransactions(local, items);
+      totals.newIds.push(...r.newIds);
       totals.imported += r.imported;
       totals.matched += r.matched;
       totals.skipped += r.skipped;
@@ -447,7 +481,7 @@ export async function mapAccounts(connId: number, mappings: Mapping[]) {
       }
     }
     // Re-read history from the beginning so newly linked accounts get their past transactions (deduped by import id).
-    if (conn.provider === 'plaid') db.prepare(`UPDATE connections SET cursor = NULL WHERE id = ?`).run(connId);
+    if (conn.provider === 'plaid') resetPlaidCursor(connId);
   })();
 
   try {
@@ -481,16 +515,42 @@ export function updateOpeningBalances(connId: number, complete: (a: { import_sta
   }
 }
 
+/** Makes the next Plaid sync re-read everything from the start (already-imported transactions are skipped by id). */
+export function resetPlaidCursor(connId: number) {
+  db.prepare(`UPDATE connections SET cursor = NULL WHERE id = ? AND provider = 'plaid'`).run(connId);
+}
+
 const running = new Map<number, Promise<any>>();
 
-export async function syncConnection(connId: number) {
+/** Connections whose last sync failed for a passing reason, or whose bank history is still arriving; the scheduler retries these early. */
+const retrySoon = new Set<number>();
+export function connectionsToRetrySoon(): number[] {
+  return [...retrySoon];
+}
+
+type SyncResult = { imported: number; matched: number; skipped: number; newIds?: number[]; warnings?: string[] };
+
+/**
+ * Imports new transactions for one bank connection. With `notify`, devices that turned on notifications hear about what
+ * arrived (used for background syncs; when you press Import yourself you're already looking).
+ */
+export async function syncConnection(connId: number, opts: { notify?: boolean } = {}): Promise<SyncResult> {
+  const r = await syncConnectionOnce(connId);
+  if (opts.notify && r.newIds?.length) await notifyNewTransactions(r.newIds);
+  return r;
+}
+
+async function syncConnectionOnce(connId: number): Promise<SyncResult> {
   // Avoid overlapping syncs of the same connection (e.g. timer + button click).
-  if (running.has(connId)) return running.get(connId);
+  if (running.has(connId)) return running.get(connId)!;
   const p = (async () => {
     const conn = getConnection(connId);
+    retrySoon.delete(connId);
     try {
-      const r: { imported: number; matched: number; skipped: number; warnings?: string[] } =
+      const r: SyncResult =
         conn.provider === 'plaid' ? await syncPlaid(connId) : await syncSimplefin(connId);
+      detectTransfers();
+      matchAmazon();
       const warning = r.warnings?.length ? 'Bank reported: ' + r.warnings.join('; ') : null;
       db.prepare(`UPDATE connections SET status = 'ok', error = ?, last_sync_at = datetime('now') WHERE id = ?`).run(warning, connId);
       return r;
@@ -499,6 +559,8 @@ export async function syncConnection(connId: number) {
       const status = err instanceof PlaidError && ['ITEM_LOGIN_REQUIRED', 'PENDING_EXPIRATION', 'PENDING_DISCONNECT'].includes(err.code)
         ? 'reauth'
         : 'error';
+      // Needing the user to sign in again won't fix itself; anything else (bank or network trouble) is worth retrying soon.
+      if (status === 'error') retrySoon.add(connId);
       db.prepare(`UPDATE connections SET status = ?, error = ?, last_sync_at = datetime('now') WHERE id = ?`).run(status, err.message, connId);
       throw e instanceof HttpError ? e : new HttpError(502, err.message);
     } finally {
@@ -509,12 +571,12 @@ export async function syncConnection(connId: number) {
   return p;
 }
 
-export async function syncAll() {
+export async function syncAll(opts: { notify?: boolean } = {}) {
   const conns = db.prepare(`SELECT id FROM connections`).all() as { id: number }[];
   const out: Record<number, unknown> = {};
   for (const c of conns) {
     try {
-      out[c.id] = await syncConnection(c.id);
+      out[c.id] = await syncConnection(c.id, opts);
     } catch (e) {
       out[c.id] = { error: (e as Error).message };
     }

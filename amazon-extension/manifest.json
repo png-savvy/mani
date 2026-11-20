@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Mani Amazon",
+  "version": "1.2.0",
+  "description": "Sends your Amazon order details to your own Mani budget, so Amazon charges show what you bought.",
+  "permissions": [
+    "alarms",
+    "storage",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://www.amazon.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://*.ts.net/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Mani Amazon",
+    "default_icon": {
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}

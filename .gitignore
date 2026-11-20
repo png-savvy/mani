@@ -5,3 +5,6 @@ data
 *.db
 *.db-*
 data-sandbox
+
+# Built browser extensions
+amazon-extension/dist/

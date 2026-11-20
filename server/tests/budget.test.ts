@@ -180,7 +180,7 @@ test('imports dedupe, auto-match manual entries, and remember payee categories',
     { importId: 'x1', date: d(M1, 12), amount: -1234, payeeName: 'COFFEE SHOP #42' },
     { importId: 'x2', date: d(M1, 12), amount: -999, payeeName: 'Market' },
   ]);
-  assert.deepEqual(r1, { imported: 1, matched: 1, skipped: 0 });
+  assert.deepEqual({ ...r1, newIds: undefined }, { imported: 1, matched: 1, skipped: 0, newIds: undefined });
   const m = db.prepare(`SELECT * FROM transactions WHERE id = ?`).get(manual) as any;
   assert.equal(m.import_id, 'x1');
   assert.equal(m.cleared, 'cleared');

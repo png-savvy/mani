@@ -8,6 +8,7 @@ import AccountPage from './components/AccountPage';
 import SettingsPage from './components/SettingsPage';
 import PayeesPage from './components/PayeesPage';
 import ScheduledPage from './components/ScheduledPage';
+import PlanPage from './components/PlanPage';
 import PlaidOAuthReturn from './components/PlaidOAuthReturn';
 import AuthScreen from './components/AuthScreen';
 import MobileNav from './components/MobileNav';
@@ -38,12 +39,14 @@ export default function App() {
             <Route path="/" element={<Navigate to="/budget" replace />} />
             <Route path="/budget" element={<BudgetPage />} />
             <Route path="/budget/:month" element={<BudgetPage />} />
+            <Route path="/review" element={<AccountPage review />} />
             <Route path="/accounts" element={<AccountPage />} />
             <Route path="/accounts/:accountId" element={<AccountPage />} />
             <Route path="/reports" element={<Suspense fallback={<div className="spinner" />}><ReportsPage /></Suspense>} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/payees" element={<PayeesPage />} />
             <Route path="/scheduled" element={<ScheduledPage />} />
+            <Route path="/plan" element={<PlanPage />} />
             <Route path="/oauth-return" element={<PlaidOAuthReturn />} />
             <Route path="*" element={<Navigate to="/budget" replace />} />
           </Routes>

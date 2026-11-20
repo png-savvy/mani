@@ -36,6 +36,8 @@ export function decrypt(blob: string): string {
 const SESSION_DAYS = 30;
 const COOKIE = 'mani_sid';
 
+export const MAX_PASSWORD_LENGTH = 1024;
+
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16);
   const hash = crypto.scryptSync(password, salt, 64);
@@ -44,7 +46,8 @@ export function hashPassword(password: string): string {
 
 export function verifyPassword(password: string, stored: string): boolean {
   const [scheme, salt, hash] = stored.split('$');
-  if (scheme !== 'scrypt') return false;
+  // No real password is this long; refusing early keeps a huge input from tying up the server.
+  if (scheme !== 'scrypt' || password.length > MAX_PASSWORD_LENGTH) return false;
   const expected = Buffer.from(hash, 'base64');
   const actual = crypto.scryptSync(password, Buffer.from(salt, 'base64'), expected.length);
   return crypto.timingSafeEqual(expected, actual);
@@ -68,11 +71,19 @@ function parseCookies(header: string | undefined): Record<string, string> {
   return out;
 }
 
+// Only a hash of each session token is stored, so a copy of the database (a backup file, say) can't be used to sign in.
+const sessionKey = (token: string) => 'h1:' + crypto.createHash('sha256').update(token).digest('hex');
+
+// Sessions saved by older versions were stored as-is; convert them in place so nobody is signed out.
+for (const r of db.prepare(`SELECT token FROM sessions WHERE token NOT LIKE 'h1:%'`).all() as { token: string }[]) {
+  db.prepare(`UPDATE OR REPLACE sessions SET token = ? WHERE token = ?`).run(sessionKey(r.token), r.token);
+}
+
 export function createSession(req: Request, res: Response) {
   const token = crypto.randomBytes(32).toString('base64url');
   const now = Date.now();
   const expires = now + SESSION_DAYS * 86400000;
-  db.prepare(`INSERT INTO sessions (token, created_at, expires_at) VALUES (?, ?, ?)`).run(token, now, expires);
+  db.prepare(`INSERT INTO sessions (token, created_at, expires_at) VALUES (?, ?, ?)`).run(sessionKey(token), now, expires);
   db.prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(now);
   const secure = req.secure ? '; Secure' : '';
   res.setHeader(
@@ -83,20 +94,20 @@ export function createSession(req: Request, res: Response) {
 
 export function destroySession(req: Request, res: Response) {
   const token = parseCookies(req.headers.cookie)[COOKIE];
-  if (token) db.prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
+  if (token) db.prepare(`DELETE FROM sessions WHERE token = ?`).run(sessionKey(token));
   res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`);
 }
 
 /** Signs out every other browser/phone (used after turning on two-step login). */
 export function revokeOtherSessions(req: Request) {
   const token = parseCookies(req.headers.cookie)[COOKIE];
-  db.prepare(`DELETE FROM sessions WHERE token != ?`).run(token ?? '');
+  db.prepare(`DELETE FROM sessions WHERE token != ?`).run(token ? sessionKey(token) : '');
 }
 
 export function isAuthed(req: Request): boolean {
   const token = parseCookies(req.headers.cookie)[COOKIE];
   if (!token) return false;
-  const row = db.prepare(`SELECT expires_at FROM sessions WHERE token = ?`).get(token) as { expires_at: number } | undefined;
+  const row = db.prepare(`SELECT expires_at FROM sessions WHERE token = ?`).get(sessionKey(token)) as { expires_at: number } | undefined;
   return !!row && row.expires_at > Date.now();
 }
 
@@ -161,10 +172,14 @@ export function clearLoginFailures(ip: string) {
   attempts.delete(ip);
 }
 
-// Basic CSRF protection: state-changing API calls must be JSON or come from our own origin.
+// CSRF protection: state-changing API calls must be JSON (or carry our own header), which another website can't send
+// without the browser asking first — and must not be marked by the browser as coming from a different site.
 export function csrfGuard(req: Request, res: Response, next: NextFunction) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-  const ct = req.headers['content-type'] || '';
-  if (ct.includes('application/json') || req.headers['x-requested-with'] === 'mani') return next();
-  res.status(403).json({ error: 'Rejected request (CSRF protection)' });
+  const reject = () => res.status(403).json({ error: 'Rejected request (CSRF protection)' });
+  if (req.headers['sec-fetch-site'] === 'cross-site') return reject();
+  // The exact media type, not "contains": `text/plain; application/json` is a form-style request in disguise.
+  const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (type === 'application/json' || req.headers['x-requested-with'] === 'mani') return next();
+  reject();
 }

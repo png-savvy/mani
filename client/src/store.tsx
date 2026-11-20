@@ -3,7 +3,16 @@ import { api } from './api';
 import { configureFormat } from './format';
 import type { Bootstrap } from './types';
 
-interface Toast {
+interface ToastOptions {
+  /** A button on the toast, e.g. Undo. The toast closes when it's pressed. */
+  action?: { label: string; onClick: () => void };
+  /** Smaller lines under the main text. */
+  lines?: string[];
+  /** How long it stays, in ms. */
+  duration?: number;
+}
+
+interface Toast extends ToastOptions {
   id: number;
   text: string;
   kind: 'info' | 'error' | 'success';
@@ -15,7 +24,7 @@ interface Ctx {
   /** Incremented after every mutation so pages can refetch their own data. */
   version: number;
   bump: () => void;
-  toast: (text: string, kind?: Toast['kind']) => void;
+  toast: (text: string, kind?: Toast['kind'], options?: ToastOptions) => void;
   run: <T>(fn: () => Promise<T>, success?: string) => Promise<T | undefined>;
 }
 
@@ -48,10 +57,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     refresh();
   }, [refresh]);
 
-  const toast = useCallback((text: string, kind: Toast['kind'] = 'info') => {
+  const toast = useCallback((text: string, kind: Toast['kind'] = 'info', options: ToastOptions = {}) => {
     const id = Date.now() + Math.random();
-    setToasts((t) => [...t, { id, text, kind }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), kind === 'error' ? 7000 : 3500);
+    setToasts((t) => [...(options.action ? t.filter((x) => !x.action) : t), { id, text, kind, ...options }]);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), options.duration ?? (kind === 'error' ? 7000 : 3500));
   }, []);
 
   const bump = useCallback(() => {
@@ -97,8 +106,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
       {children}
       <div className="toasts" role="status" aria-live="polite">
         {toasts.map((t) => (
-          <div key={t.id} className={`toast toast-${t.kind}`}>
-            {t.text}
+          <div key={t.id} className={`toast toast-${t.kind} ${t.action ? 'toast-action' : ''}`}>
+            <div className="toast-body">
+              <div>{t.text}</div>
+              {t.lines?.map((l) => (
+                <div key={l} className="toast-line">{l}</div>
+              ))}
+            </div>
+            {t.action && (
+              <button
+                className="toast-btn"
+                onClick={() => {
+                  setToasts((all) => all.filter((x) => x.id !== t.id));
+                  t.action!.onClick();
+                }}
+              >
+                {t.action.label}
+              </button>
+            )}
           </div>
         ))}
       </div>

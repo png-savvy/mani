@@ -7,6 +7,8 @@ import { Confirm, Modal } from './ui';
 import { ConnectBankModal, LinkHelp, MapAccounts } from './ConnectBank';
 import type { Connection } from '../types';
 import TwoFactorSettings from './TwoFactorSettings';
+import NotificationSettings from './NotificationSettings';
+import AmazonSettings from './AmazonSettings';
 
 export default function SettingsPage() {
   const { data, version, run, toast, bump } = useApp();
@@ -114,6 +116,10 @@ export default function SettingsPage() {
         </details>
       </section>
 
+      <NotificationSettings />
+
+      <AmazonSettings />
+
       <section className="card">
         <h2>Budget Settings</h2>
         <div className="form grid-2">
@@ -122,6 +128,13 @@ export default function SettingsPage() {
             <select value={s.budgetMode} onChange={(e) => setS({ ...s, budgetMode: e.target.value as 'rolling' | 'monthly' })}>
               <option value="rolling">Rolling — balances carry over, cover overspending whenever you want</option>
               <option value="monthly">Monthly — overspending resets each month</option>
+            </select>
+          </label>
+          <label>
+            Credit card payment categories
+            <select value={s.showCcPayments ? 'show' : 'hide'} onChange={(e) => setS({ ...s, showCcPayments: e.target.value === 'show' })}>
+              <option value="show">Show on the Budget page</option>
+              <option value="hide">Hide (I don't budget for card payments)</option>
             </select>
           </label>
           <label>

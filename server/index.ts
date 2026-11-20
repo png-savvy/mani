@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { api } from './api.ts';
+import { amazonRouter } from './amazon.ts';
 import { csrfGuard } from './security.ts';
 import { startScheduler } from './scheduler.ts';
 import { DB_PATH } from './db.ts';
@@ -22,6 +23,8 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'same-origin');
   res.setHeader('X-Frame-Options', 'DENY');
+  // Once reached over HTTPS, browsers should refuse to fall back to plain HTTP for this address.
+  if (req.secure) res.setHeader('Strict-Transport-Security', 'max-age=15552000');
   res.setHeader(
     'Content-Security-Policy',
     [
@@ -37,6 +40,22 @@ app.use((req, res, next) => {
   next();
 });
 
+// Which build of the app is being served, so an open app (e.g. installed on a phone, which never reloads by itself)
+// can notice an update and reload.
+app.get('/api/version', (_req, res) => {
+  let build = 'dev';
+  try {
+    const st = fs.statSync(path.join(clientDir, 'index.html'));
+    build = `${st.mtimeMs.toFixed(0)}-${st.size}`;
+  } catch {
+    // not built (development)
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ build });
+});
+
+// The Amazon extension signs in with its own token (Settings → Amazon), not your login.
+app.use('/api/integrations/amazon', amazonRouter);
 app.use('/api', express.json({ limit: '15mb' }), csrfGuard, api);
 
 const here = path.dirname(fileURLToPath(import.meta.url));

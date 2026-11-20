@@ -5,8 +5,8 @@ import { money } from '../format';
 import { CategorySelect, Confirm, MoneyField, PayeeField, TRANSFER_PREFIX } from './ui';
 import CategoryPicker from './CategoryPicker';
 import { useIsMobile } from '../hooks';
-import type { Txn } from '../types';
-import { FLAGS, FREQUENCIES, FREQUENCY_LABELS, todayISO } from '../../../shared/util';
+import type { BudgetMonth, Txn } from '../types';
+import { FLAGS, FREQUENCIES, FREQUENCY_LABELS, currentMonth, todayISO } from '../../../shared/util';
 
 interface SubLine {
   categoryId: number | null;
@@ -83,6 +83,15 @@ export default function TxnEditor({
     }
   };
 
+  /** Current balance of each category (Ready to Assign for the income category), for the before/after popup. */
+  const fetchBalances = async () => {
+    const v = await api.get<BudgetMonth>(`/budget/${currentMonth()}`);
+    const m = new Map(v.groups.flatMap((g) => g.categories.map((c) => [c.id, c.available] as const)));
+    const income = data.categories.find((c) => c.kind === 'income');
+    if (income) m.set(income.id, v.readyToAssign.total);
+    return m;
+  };
+
   const save = async (andNew: boolean) => {
     if (!acct) return toast('Choose an account', 'error');
     if (payee.startsWith(TRANSFER_PREFIX) && !transferAccount) return toast('Unknown transfer account', 'error');
@@ -109,7 +118,38 @@ export default function TxnEditor({
       }
       ok = await run(() => api.post('/scheduled', { ...body, frequency: repeat }), date > todayISO() ? 'Scheduled' : 'Saved and scheduled');
     } else {
+      // Changing an existing transaction's category: show what it did to the balances, with a way back.
+      const oldCat = txn ? txn.categoryId : null;
+      const newCat = body.categoryId;
+      const recategorized = !!txn && !txn.isSplit && !split && categoryMode === 'normal' && oldCat !== newCat;
+      const before = recategorized ? await fetchBalances().catch(() => null) : null;
       ok = await run(() => (txn ? api.put(`/transactions/${txn.id}`, body) : api.post('/transactions', body)));
+      if (ok !== undefined && recategorized && txn) {
+        const after = await fetchBalances().catch(() => null);
+        const name = (id: number) => {
+          const c = data.categories.find((x) => x.id === id);
+          return c?.kind === 'income' ? 'Ready to Assign' : c?.name ?? 'Category';
+        };
+        const line = (id: number | null) =>
+          id !== null && before?.has(id) && after?.has(id) ? `${name(id)}: ${money(before.get(id)!)} → ${money(after.get(id)!)}` : null;
+        const to = line(newCat);
+        const from = line(oldCat);
+        // Undo restores the category and approval (other edits made in the same save are kept), and the category this
+        // payee is remembered under — unless the payee itself was changed too.
+        const samePayee = (txn.payeeName ?? '') === (body.payeeName ?? '');
+        const undo = {
+          categoryId: oldCat,
+          approved: txn.approved,
+          payeeLastCategoryId: samePayee && txn.payeeId ? data.payees.find((x) => x.id === txn.payeeId)?.lastCategoryId ?? null : undefined,
+        };
+        // Red when the category it went into is now overspent.
+        const overspent = newCat !== null && (after?.get(newCat) ?? 0) < 0;
+        toast(newCat === null ? 'Sent back to review' : to ?? 'Categorized', overspent ? 'error' : 'success', {
+          lines: from ? [from] : undefined,
+          duration: 2000,
+          action: { label: 'Undo', onClick: () => run(() => api.post(`/transactions/${txn.id}/undo-categorize`, { undo }), 'Put back') },
+        });
+      }
     }
     setBusy(false);
     if (ok === undefined) return;
@@ -141,6 +181,11 @@ export default function TxnEditor({
     />
   );
 
+  const splitRemaining = amount - splitTotal;
+  /** A split line holding this net amount (negative = outflow). */
+  const withNet = (l: SubLine, net: number): SubLine => ({ ...l, outflow: net < 0 ? -net : 0, inflow: net > 0 ? net : 0 });
+  const hasEmptySplitLine = !!split?.some((l) => !l.inflow && !l.outflow);
+
   const splitEditor = split && (
     <div className="split-box">
       {split.map((l, i) => (
@@ -162,11 +207,21 @@ export default function TxnEditor({
             onCommit={(v) => setSplit(split.map((x, j) => (j === i ? { ...x, inflow: v, outflow: v ? 0 : x.outflow } : x)))}
           />
           <button className="mini-btn" onClick={() => setSplit(split.length > 2 ? split.filter((_, j) => j !== i) : split)} aria-label="Remove line">×</button>
+          {splitRemaining !== 0 && (
+            <button
+              className={`split-rest ${!l.inflow && !l.outflow ? 'primary' : ''}`}
+              onClick={() => setSplit(split.map((x, j) => (j === i ? withNet(x, x.inflow - x.outflow + splitRemaining) : x)))}
+            >
+              {!l.inflow && !l.outflow ? `Assign remaining ${money(splitRemaining)} here` : `Add remaining ${money(splitRemaining)} to this line`}
+            </button>
+          )}
         </div>
       ))}
       <div className="split-foot">
-        <button className="btn btn-small btn-ghost" onClick={() => setSplit([...split, { categoryId: null, memo: '', outflow: 0, inflow: 0 }])}>+ Add split line</button>
-        <span className={splitTotal === amount ? 'muted' : 'neg'}>Remaining to assign: {money(amount - splitTotal)}</span>
+        <button className="btn btn-small btn-ghost" onClick={() => setSplit([...split, withNet({ categoryId: null, memo: '', outflow: 0, inflow: 0 }, hasEmptySplitLine ? 0 : splitRemaining)])}>
+          {splitRemaining !== 0 && !hasEmptySplitLine ? `+ Add line with remaining ${money(splitRemaining)}` : '+ Add split line'}
+        </button>
+        <span className={splitRemaining === 0 ? 'split-ok' : 'neg'}>{splitRemaining === 0 ? '✓ Fully assigned' : `Remaining to assign: ${money(splitRemaining)}`}</span>
         <button className="btn btn-small btn-ghost" onClick={() => setSplit(null)}>Remove split</button>
       </div>
     </div>
@@ -281,6 +336,26 @@ export default function TxnEditor({
         )}
         {splitEditor}
         {txn?.importedPayee && <p className="muted small">Bank description: {txn.importedPayee}</p>}
+        {txn?.amazon && (
+          <div className="amazon-items small">
+            <b>Amazon order</b>{' '}
+            <a href={`https://www.amazon.com/gp/your-account/order-details?orderID=${encodeURIComponent(txn.amazon.orderId)}`} target="_blank" rel="noreferrer">
+              {txn.amazon.orderId}
+            </a>
+            {txn.amazon.items.length > 0 ? (
+              <ul>
+                {txn.amazon.items.map((it) => (
+                  <li key={it}>{it}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="muted">Item details haven't arrived yet.</p>
+            )}
+          </div>
+        )}
+        {txn?.autoTransfer && txn.transferAccountId && (
+          <p className="muted small">Mani found the other half of this transfer in your other account and joined them. Pick a payee instead to separate them.</p>
+        )}
 
         <div className="m-actions">
           {txn && <button className="btn btn-danger-ghost" onClick={() => setConfirmDelete(true)}>Delete</button>}
@@ -292,6 +367,10 @@ export default function TxnEditor({
           <CategoryPicker
             value={categoryId}
             onClose={() => setPicking(false)}
+            onClear={() => {
+              setCategoryId(null);
+              setPicking(false);
+            }}
             onSelect={(id) => {
               setCategoryId(id);
               setPicking(false);

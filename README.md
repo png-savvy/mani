@@ -256,11 +256,16 @@ $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" 
 Register-ScheduledTask -TaskName "Mani budget" -Action $action -Trigger $trigger -Settings $settings -Principal $principal
 ```
 
-**Reaching it from other devices on your Wi-Fi (WSL).** Mani listens privately on port 3001 (`HOST=127.0.0.1`, `PORT=3001` in `.env`), and a Windows port-forwarding rule publishes it as port 3000. If WSL uses mirrored networking, Mani and the forwarding rule can't both use port 3000. In admin PowerShell:
+**Port forwarding (WSL).** Mani listens privately on port 3001 (`HOST=127.0.0.1`, `PORT=3001` in `.env`), and a Windows port-forwarding rule publishes it as port 3000. If WSL uses mirrored networking, Mani and the forwarding rule can't both use port 3000. In admin PowerShell:
 
 ```powershell
-netsh interface portproxy add v4tov4 listenport=3000 listenaddress=0.0.0.0 connectport=3001 connectaddress=127.0.0.1
+netsh interface portproxy add v4tov4 listenport=3000 listenaddress=127.0.0.1 connectport=3001 connectaddress=127.0.0.1
 ```
+
+That is all Tailscale needs (`tailscale serve --bg 3000` connects to `127.0.0.1:3000`), and nothing else on your network can reach the app.
+
+Only if you also want to open `http://<computer's LAN IP>:3000` from other devices on your Wi-Fi, use `listenaddress=0.0.0.0` instead and allow the port through the firewall. That traffic is plain, unencrypted HTTP, and every device on the network can reach the login page:
+
 ```powershell
 New-NetFirewallRule -DisplayName "Mani budget (port 3000)" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow -Profile Private
 ```
@@ -315,6 +320,7 @@ On phones the app switches to a touch layout:
 
 To open it on your phone, the phone must be able to reach the server:
 - **Tailscale (recommended):** install it on the server and your phone, run `tailscale serve --bg 3000`, and open `https://<machine>.<tailnet>.ts.net` on your phone. This works from anywhere and stays private.
+  - **Serve vs Funnel.** `tailscale serve` is private: only devices signed in to your Tailscale account can open the address, so the phone needs the Tailscale app connected. `tailscale funnel` publishes the same address to the whole internet, so it works in any browser without the Tailscale app, but anyone can reach the login page. Check which one you have with `tailscale serve status` ("Funnel on" means public); `tailscale funnel reset` followed by `tailscale serve --bg 3000` goes back to private. If you use Funnel, turn on two-step login first and use a long password.
 - **Same Wi-Fi only:** set `HOST=0.0.0.0` in `.env`, restart, and open `http://<computer's LAN IP>:3000`. On WSL you'll also need Windows port forwarding, so Tailscale is easier.
 
 Then add it to your home screen so it opens full screen like an app:

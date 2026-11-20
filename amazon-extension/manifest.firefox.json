@@ -1,0 +1,64 @@
+{
+  "manifest_version": 2,
+  "name": "Mani Amazon",
+  "version": "1.2.0",
+  "description": "Sends your Amazon order details to your own Mani budget, so Amazon charges show what you bought.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "mani-amazon@mani-budget",
+      "strict_min_version": "115.0",
+      "data_collection_permissions": {
+        "required": [
+          "websiteContent",
+          "financialAndPaymentInfo"
+        ]
+      }
+    }
+  },
+  "permissions": [
+    "alarms",
+    "storage",
+    "https://www.amazon.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://*.ts.net/*"
+  ],
+  "optional_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "page": "background-firefox.html",
+    "persistent": true
+  },
+  "browser_action": {
+    "default_popup": "popup.html",
+    "default_title": "Mani Amazon",
+    "default_icon": {
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.amazon.com/your-orders/*",
+        "https://www.amazon.com/cpe/yourpayments/*",
+        "https://www.amazon.com/gp/your-account/order-history*",
+        "https://www.amazon.com/gp/css/order-history*"
+      ],
+      "js": [
+        "reader.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

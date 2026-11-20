@@ -1,9 +1,11 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
+import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { db, getSetting, setSetting, getAccount, payeeIdByName, rtaCategoryId } from './db.ts';
 import {
+  MAX_PASSWORD_LENGTH,
   clearLoginFailures,
   createSession,
   destroySession,
@@ -28,9 +30,14 @@ import {
   twoFactorEnabled,
   verifySecondFactor,
 } from './totp.ts';
-import { HttpError, accountBalances, deleteTransaction, importTransactions, listTransactions, saveTransaction, type TxnInput } from './txns.ts';
+import { amazonStatus, newAmazonToken, revokeAmazonToken } from './amazon.ts';
+import { categorizeTransaction, needsCategory, undoCategorize } from './categorize.ts';
+import { pushStatus, removeDevice, sendToAll, subscribe, unsubscribe } from './push.ts';
+import { HttpError, accountBalances, deleteTransaction, separateTransfer, importTransactions, listTransactions, saveTransaction, type TxnInput } from './txns.ts';
 import { createAccount, deleteAccount, listAccounts, reconcileAccount, updateAccount } from './accounts.ts';
 import { budgetMode, compute, monthView, targetStatus, emptyState } from './budget.ts';
+import { applyPlan, getPlan, planPreview, planStatus, savePlan, skipPlan } from './plan.ts';
+import { insights } from './insights.ts';
 import {
   deleteConnection,
   listConnections,
@@ -93,6 +100,7 @@ api.post(
     if (isSetUp()) throw new HttpError(400, 'Already set up');
     const pw = String(req.body?.password ?? '');
     if (pw.length < 8) throw new HttpError(400, 'Use a password of at least 8 characters');
+    if (pw.length > MAX_PASSWORD_LENGTH) throw new HttpError(400, 'That password is too long');
     setPassword(pw);
     if (req.body?.budgetName) setSetting('budget_name', String(req.body.budgetName).slice(0, 100));
     if (req.body?.currency) setSetting('currency', String(req.body.currency).slice(0, 3).toUpperCase());
@@ -190,6 +198,7 @@ api.post(
     if (!verifyPassword(String(req.body?.current ?? ''), stored)) throw new HttpError(400, 'Current password is incorrect');
     const next = String(req.body?.next ?? '');
     if (next.length < 8) throw new HttpError(400, 'Use a password of at least 8 characters');
+    if (next.length > MAX_PASSWORD_LENGTH) throw new HttpError(400, 'That password is too long');
     setPassword(next);
     db.prepare(`DELETE FROM sessions`).run();
   }),
@@ -205,6 +214,7 @@ function settingsObject() {
     dateFormat: getSetting('date_format') || 'MM/DD/YYYY',
     syncIntervalHours: syncIntervalHours(),
     budgetMode: budgetMode(),
+    showCcPayments: getSetting('show_cc_payments') !== '0',
   };
 }
 
@@ -227,12 +237,14 @@ function accountsWithBalances() {
       connectionStatus: a.connection_status,
       connectionError: a.connection_error,
       lastImportAt: a.last_import_at,
+      lastCheckedAt: a.connection_last_sync,
       bankBalance: a.bank_balance,
       importStart: a.import_start,
       balance: b.working,
       clearedBalance: b.cleared,
       unclearedBalance: b.uncleared,
       unapprovedCount: b.unapproved,
+      reviewCount: b.review,
     };
   });
 }
@@ -280,6 +292,7 @@ api.put(
       if (!['rolling', 'monthly'].includes(b.budgetMode)) throw new HttpError(400, 'Invalid budget style');
       setSetting('budget_mode', b.budgetMode);
     }
+    if (b.showCcPayments !== undefined) setSetting('show_cc_payments', b.showCcPayments ? '1' : '0');
     if (b.syncIntervalHours !== undefined) {
       const n = Number(b.syncIntervalHours);
       if (!Number.isFinite(n) || n < 0 || n > 168) throw new HttpError(400, 'Sync interval must be 0–168 hours');
@@ -401,6 +414,9 @@ api.post('/transactions', h((req) => ({ id: saveTransaction(txnInput(req.body ||
 api.put('/transactions/:id', h((req) => ({ id: saveTransaction(txnInput(req.body || {}), int(req.params.id)) })));
 api.delete('/transactions/:id', h((req) => deleteTransaction(int(req.params.id))));
 
+api.post('/transactions/:id/categorize', h((req) => categorizeTransaction(int(req.params.id), optInt(req.body?.categoryId))));
+api.post('/transactions/:id/undo-categorize', h((req) => undoCategorize(int(req.params.id), req.body?.undo ?? {})));
+
 api.post(
   '/transactions/bulk',
   h((req) => {
@@ -412,6 +428,8 @@ api.post(
         if (!row) continue;
         switch (action) {
           case 'approve':
+            // Spending that still needs a category stays in review until it has one.
+            if (needsCategory(id)) break;
             db.prepare(`UPDATE transactions SET approved = 1 WHERE id = ?`).run(id);
             if (row.category_id && row.payee_id) {
               db.prepare(`UPDATE payees SET last_category_id = ? WHERE id = ? AND ? != ?`).run(row.category_id, row.payee_id, row.category_id, rtaCategoryId());
@@ -429,6 +447,9 @@ api.post(
             break;
           case 'delete':
             deleteTransaction(id);
+            break;
+          case 'separate-transfer':
+            separateTransfer(id);
             break;
           case 'categorize': {
             const cat = optInt(req.body?.categoryId);
@@ -464,7 +485,21 @@ api.post(
 
 // ---------------------------------------------------------------- budget
 
-api.get('/budget/:month', h((req) => monthView(month(req.params.month))));
+api.get(
+  '/budget/:month',
+  h((req) => {
+    const view = monthView(month(req.params.month));
+    return { ...view, plan: planStatus(view.month) };
+  }),
+);
+
+// ---------------------------------------------------------------- monthly plan
+
+api.get('/plan', h(() => getPlan()));
+api.put('/plan', h((req) => savePlan({ income: req.body?.income, amounts: req.body?.amounts, percents: req.body?.percents })));
+api.post('/plan/skip/:month', h((req) => skipPlan(month(req.params.month))));
+api.get('/plan/preview/:month', h((req) => planPreview(month(req.params.month))));
+api.post('/plan/apply/:month', h((req) => applyPlan(month(req.params.month), req.body?.again === true)));
 
 function setAssigned(categoryId: number, m: Month, amount: number) {
   const cat = db.prepare(`SELECT kind FROM categories WHERE id = ?`).get(categoryId) as { kind: string } | undefined;
@@ -942,6 +977,8 @@ const CATEGORY_ACTIVITY_SQL = `
   WHERE a.on_budget = 1 AND substr(c.date,1,7) BETWEEN ? AND ?
   GROUP BY c.category_id, month`;
 
+api.get('/reports/insights', h(() => insights()));
+
 api.get(
   '/reports/spending',
   h((req) => {
@@ -1059,12 +1096,41 @@ api.post(
 api.post('/connections/:id/map', h(async (req) => mapAccounts(int(req.params.id), Array.isArray(req.body?.mappings) ? req.body.mappings : [])));
 api.post('/connections/:id/sync', h(async (req) => syncConnection(int(req.params.id))));
 api.post('/connections/sync-all', h(async () => syncAll()));
+
+// ---------------------------------------------------------------- Amazon extension
+
+api.get('/amazon', h(() => amazonStatus()));
+api.post('/amazon/token', h(() => ({ token: newAmazonToken() })));
+api.delete('/amazon/token', h(() => revokeAmazonToken()));
+
+// ---------------------------------------------------------------- push notifications
+
+api.get('/push', h(() => pushStatus()));
+api.post(
+  '/push/subscribe',
+  h((req) => subscribe(req.body?.subscription, String(req.body?.label ?? ''), req.get('origin') ?? undefined)),
+);
+api.post('/push/unsubscribe', h((req) => unsubscribe(String(req.body?.endpoint ?? ''))));
+api.delete('/push/devices/:id', h((req) => removeDevice(int(req.params.id))));
+api.post(
+  '/push/test',
+  h(async (req) => {
+    const sent = await sendToAll(
+      { title: 'Mani notifications are on', body: "You'll get a note here whenever new transactions come in from your bank.", url: '/review', tag: 'test' },
+      req.body?.endpoint ? String(req.body.endpoint) : undefined,
+    );
+    if (!sent) throw new HttpError(502, "The notification couldn't be delivered. Turn notifications off and on again on this device.");
+    return { sent };
+  }),
+);
 api.delete('/connections/:id', h(async (req) => deleteConnection(int(req.params.id))));
 
 // ---------------------------------------------------------------- export / backup
 
 function csvCell(v: unknown): string {
-  const s = v === null || v === undefined ? '' : String(v);
+  let s = v === null || v === undefined ? '' : String(v);
+  // A payee or memo starting with = + - @ would be run as a formula by Excel/Sheets; a leading apostrophe makes it text.
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
@@ -1091,12 +1157,20 @@ api.get('/export/transactions.csv', (req, res) => {
 });
 
 api.get('/export/backup.db', async (req, res, next) => {
-  const tmp = path.join(os.tmpdir(), `mani-backup-${Date.now()}.db`);
+  // A private folder (only this user can open it), not a guessable name in the shared temp folder.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mani-backup-'));
+  const tmp = path.join(dir, 'backup.db');
+  const cleanup = () => fs.rm(dir, { recursive: true, force: true }, () => {});
   try {
     await db.backup(tmp);
-    res.download(tmp, `budget-backup-${todayISO()}.db`, () => fs.rm(tmp, { force: true }, () => {}));
+    // The copy is for restoring your budget, not your logins: signed-in sessions are left out.
+    const copy = new Database(tmp);
+    copy.exec('DELETE FROM sessions; VACUUM;');
+    copy.close();
+    res.setHeader('Cache-Control', 'no-store');
+    res.download(tmp, `budget-backup-${todayISO()}.db`, cleanup);
   } catch (e) {
-    fs.rm(tmp, { force: true }, () => {});
+    cleanup();
     next(e);
   }
 });
